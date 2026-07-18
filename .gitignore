@@ -1,0 +1,7 @@
+.ssh/
+*.log
+license-platform/data/
+_pisofi_site_copy/
+*.tmp
+*.bak
+*.codexbak.*

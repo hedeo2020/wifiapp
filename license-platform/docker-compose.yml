@@ -1,0 +1,13 @@
+services:
+  license-platform:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    volumes:
+      - license-platform-data:/data
+
+volumes:
+  license-platform-data:
