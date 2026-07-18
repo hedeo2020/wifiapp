@@ -29,6 +29,7 @@ PUBLIC_ADMIN_URL=https://cpanel.3dbpoint.com
 APP_SECRET=replace-with-a-long-random-secret
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=replace-with-a-strong-password
+DEFAULT_API_TOKEN=replace-with-a-generated-device-api-token
 DATA_DIR=/data
 ```
 

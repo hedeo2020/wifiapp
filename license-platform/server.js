@@ -10,6 +10,7 @@ const env = {
   appSecret: process.env.APP_SECRET || "dev-secret-change-me-before-production",
   adminUsername: process.env.ADMIN_USERNAME || "admin",
   adminPassword: process.env.ADMIN_PASSWORD || "change-me",
+  defaultApiToken: process.env.DEFAULT_API_TOKEN || "dev-token-change-me",
   publicApiUrl: process.env.PUBLIC_API_URL || "https://api.3dbpoint.com",
   publicAdminUrl: process.env.PUBLIC_ADMIN_URL || "https://cpanel.3dbpoint.com",
 };
@@ -38,7 +39,7 @@ async function loadDb() {
         {
           id: id("tok"),
           name: "Default device API token",
-          tokenHash: sha256("dev-token-change-me"),
+          tokenHash: sha256(env.defaultApiToken),
           createdAt: now(),
           lastUsedAt: null,
         },
