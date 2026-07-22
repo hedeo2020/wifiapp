@@ -102,6 +102,7 @@ function ensureCore(db) {
   db.licenses ||= [];
   db.users ||= [];
   db.chats ||= [];
+  db.operations ||= [];
   db.apiTokens ||= [];
   db.audit ||= [];
   ensureEload(db);
@@ -376,6 +377,24 @@ function publicChatMessage(message) {
   };
 }
 
+function publicOperation(operation) {
+  return {
+    id: operation.id,
+    deviceSerial: operation.deviceSerial,
+    command: operation.command,
+    payload: operation.payload || {},
+    status: operation.status || "pending",
+    result: operation.result || null,
+    createdAt: operation.createdAt,
+    updatedAt: operation.updatedAt,
+    acknowledgedAt: operation.acknowledgedAt || null,
+  };
+}
+
+function activeLicenseForDevice(db, serial) {
+  return db.licenses.find((item) => item.deviceSerial === serial && licenseStatus(item) === "active") || null;
+}
+
 function page(title, body) {
   return `<!doctype html>
 <html lang="en">
@@ -391,14 +410,16 @@ function page(title, body) {
     nav a{color:#cbd5e1;margin-left:14px}.brand{font-weight:750;color:#fff}.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px;margin:16px 0}
     .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.card{background:#fff;border:1px solid var(--line);border-radius:8px;padding:16px}
     .metric{font-size:28px;font-weight:750}.muted{color:var(--muted)} table{width:100%;border-collapse:collapse;background:#fff} th,td{padding:10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
-    input,select{width:100%;padding:10px;border:1px solid #cfd7e6;border-radius:6px;background:#fff} label{font-weight:650;display:block;margin:10px 0 4px}
-    button,.btn{display:inline-block;background:var(--brand);color:#fff;border:0;border-radius:6px;padding:9px 12px;cursor:pointer}.btn.secondary{background:#475569}.btn.danger{background:#dc2626}
-    .row{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.pill{display:inline-block;padding:3px 8px;border-radius:999px;background:#e2e8f0}.ok{background:#dcfce7;color:#166534}.bad{background:#fee2e2;color:#991b1b}
+    input,select,textarea{width:100%;padding:10px;border:1px solid #cfd7e6;border-radius:6px;background:#fff} textarea{min-height:96px} label{font-weight:650;display:block;margin:10px 0 4px}
+    button,.btn{display:inline-block;background:var(--brand);color:#fff;border:0;border-radius:6px;padding:9px 12px;cursor:pointer}.secondary,.btn.secondary{background:#475569}.danger,.btn.danger{background:#dc2626}.success,.btn.success{background:#16a34a}.warning,.btn.warning{background:#f59e0b;color:#111827}
+    .row{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.pill{display:inline-block;padding:3px 8px;border-radius:999px;background:#e2e8f0}.ok{background:#dcfce7;color:#166534}.bad{background:#fee2e2;color:#991b1b}.warn{background:#fef3c7;color:#92400e}
+    .actions{display:flex;gap:8px;flex-wrap:wrap}.actions form{display:inline}.split{display:grid;grid-template-columns:1fr 1fr;gap:16px}.stack>*+*{margin-top:10px}.tiny{font-size:12px}.scroll{overflow:auto}
     pre{white-space:pre-wrap;background:#0f172a;color:#dbeafe;padding:14px;border-radius:8px;overflow:auto}
+    @media(max-width:760px){.top{display:block}nav a{display:inline-block;margin:8px 10px 0 0}.split{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
-<header><div class="top"><div class="brand">3DBPoint CPanel</div><nav><a href="/">Dashboard</a><a href="/admin/devices">Devices</a><a href="/admin/licenses">Licenses</a><a href="/admin/users">Users</a><a href="/admin/chats">Chats</a><a href="/admin/eload">E-Load</a><a href="/admin/tokens">API Tokens</a><a href="/docs">Docs</a><form method="post" action="/logout" style="display:inline"><button class="secondary" style="padding:6px 9px;margin-left:12px">Logout</button></form></nav></div></header>
+<header><div class="top"><div class="brand">3DBPoint CPanel</div><nav><a href="/">Dashboard</a><a href="/admin/devices">Devices</a><a href="/admin/licenses">Licenses</a><a href="/admin/users">Users</a><a href="/admin/operations">Operations</a><a href="/admin/chats">Chats</a><a href="/admin/eload">E-Load</a><a href="/admin/tokens">API Tokens</a><a href="/admin/audit">Audit</a><a href="/docs">Docs</a><form method="post" action="/logout" style="display:inline"><button class="secondary" style="padding:6px 9px;margin-left:12px">Logout</button></form></nav></div></header>
 <main class="wrap">${body}</main>
 </body></html>`;
 }
@@ -428,6 +449,8 @@ async function admin(req, res, url, db) {
   if (url.pathname === "/") {
     ensureEload(db);
     const active = db.licenses.filter((license) => licenseStatus(license) === "active").length;
+    const pendingOps = db.operations.filter((operation) => (operation.status || "pending") === "pending").length;
+    const orderCount = db.eload.orders.length;
     const balance = db.eload.accounts.reduce((sum, account) => sum + Number(account.balance || 0), 0);
     return send(res, 200, page("Dashboard", `
       <h1>Dashboard</h1>
@@ -439,7 +462,10 @@ async function admin(req, res, url, db) {
         <div class="card"><div class="metric">${db.apiTokens.length}</div><div class="muted">API Tokens</div></div>
         <div class="card"><div class="metric">${db.users.length}</div><div class="muted">Users</div></div>
         <div class="card"><div class="metric">${db.chats.filter((m) => m.status === "unread" && !m.senderAdmin).length}</div><div class="muted">Unread Chats</div></div>
+        <div class="card"><div class="metric">${pendingOps}</div><div class="muted">Pending Operations</div></div>
+        <div class="card"><div class="metric">${orderCount}</div><div class="muted">E-Load Orders</div></div>
       </div>
+      <div class="panel"><h2>Remote Admin</h2><p>Operate registrations, licenses, chat replies, e-load balances/products, and device command queues from this API panel.</p><p class="actions"><a class="btn" href="/admin/operations">Send Device Command</a><a class="btn secondary" href="/admin/chats">Open Chats</a><a class="btn success" href="/admin/eload">Manage E-Load</a></p></div>
       <div class="panel"><h2>Domains</h2><p><b>API:</b> ${escapeHtml(env.publicApiUrl)}</p><p><b>Admin:</b> ${escapeHtml(env.publicAdminUrl)}</p></div>
     `), { "Content-Type": "text/html" });
   }
@@ -448,8 +474,26 @@ async function admin(req, res, url, db) {
     const form = await formBody(req);
     const serial = String(form.serial || "").trim();
     if (serial && !db.devices.some((d) => d.serial === serial)) {
-      db.devices.push({ id: id("dev"), serial, name: String(form.name || serial), status: "active", createdAt: now(), updatedAt: now(), lastSeenAt: null });
+      db.devices.push({ id: id("dev"), serial, name: String(form.name || serial), status: "active", ownerUserId: String(form.ownerUserId || "") || null, createdAt: now(), updatedAt: now(), lastSeenAt: null });
       db.audit.push({ at: now(), action: "device.created", serial });
+      await saveDb(db);
+    }
+    return redirect(res, "/admin/devices");
+  }
+
+  const deviceAction = url.pathname.match(/^\/admin\/devices\/([^/]+)\/(update|disable|enable)$/);
+  if (deviceAction && req.method === "POST") {
+    const device = db.devices.find((item) => item.id === deviceAction[1]);
+    if (device) {
+      if (deviceAction[2] === "update") {
+        const form = await formBody(req);
+        device.name = String(form.name || device.name || device.serial);
+        device.ownerUserId = String(form.ownerUserId || "") || null;
+      } else {
+        device.status = deviceAction[2] === "disable" ? "disabled" : "active";
+      }
+      device.updatedAt = now();
+      db.audit.push({ at: now(), action: `device.${deviceAction[2]}`, serial: device.serial });
       await saveDb(db);
     }
     return redirect(res, "/admin/devices");
@@ -458,17 +502,55 @@ async function admin(req, res, url, db) {
   if (url.pathname === "/admin/devices") {
     return send(res, 200, page("Devices", `
       <h1>Devices</h1>
-      <div class="panel"><form method="post"><div class="row"><div><label>Serial</label><input name="serial" required></div><div><label>Name</label><input name="name"></div></div><p><button>Add Device</button></p></form></div>
-      <div class="panel"><table><thead><tr><th>Serial</th><th>Name</th><th>Status</th><th>Last Seen</th><th>Created</th></tr></thead><tbody>${db.devices.map((d) => `<tr><td>${escapeHtml(d.serial)}</td><td>${escapeHtml(d.name)}</td><td>${escapeHtml(d.status)}</td><td>${escapeHtml(d.lastSeenAt || "")}</td><td>${escapeHtml(d.createdAt)}</td></tr>`).join("")}</tbody></table></div>
+      <div class="panel"><form method="post"><div class="row"><div><label>Serial</label><input name="serial" required></div><div><label>Name</label><input name="name"></div><div><label>Owner</label><select name="ownerUserId"><option value="">No owner</option>${db.users.map((u) => `<option value="${escapeHtml(u.id)}">${escapeHtml(u.email)}</option>`).join("")}</select></div></div><p><button>Add Device</button></p></form></div>
+      <div class="panel scroll"><table><thead><tr><th>Serial</th><th>Name / Owner</th><th>Status</th><th>License</th><th>Last Seen</th><th>Remote Actions</th></tr></thead><tbody>${db.devices.map((d) => {
+        const owner = d.ownerUserId ? db.users.find((u) => u.id === d.ownerUserId) : null;
+        const license = activeLicenseForDevice(db, d.serial);
+        return `<tr><td><code>${escapeHtml(d.serial)}</code></td><td><form method="post" action="/admin/devices/${escapeHtml(d.id)}/update"><label class="tiny">Name</label><input name="name" value="${escapeHtml(d.name)}"><label class="tiny">Owner</label><select name="ownerUserId"><option value="">No owner</option>${db.users.map((u) => `<option value="${escapeHtml(u.id)}" ${u.id === d.ownerUserId ? "selected" : ""}>${escapeHtml(u.email)}</option>`).join("")}</select><p><button class="secondary">Save</button></p></form>${owner ? `<span class="muted tiny">Owner: ${escapeHtml(owner.email)}</span>` : ""}</td><td><span class="pill ${d.status === "active" ? "ok" : "bad"}">${escapeHtml(d.status)}</span></td><td>${license ? `<span class="pill ok">${escapeHtml(license.plan)}</span><br><small>${escapeHtml(license.expiresAt || "never expires")}</small>` : `<span class="pill bad">No active license</span>`}</td><td>${escapeHtml(d.lastSeenAt || "")}</td><td><div class="actions"><form method="post" action="/admin/operations"><input type="hidden" name="deviceSerial" value="${escapeHtml(d.serial)}"><input type="hidden" name="command" value="sync-license"><button>Sync License</button></form><form method="post" action="/admin/operations"><input type="hidden" name="deviceSerial" value="${escapeHtml(d.serial)}"><input type="hidden" name="command" value="reload-portal"><button class="success">Reload Portal</button></form><form method="post" action="/admin/devices/${escapeHtml(d.id)}/${d.status === "active" ? "disable" : "enable"}"><button class="${d.status === "active" ? "danger" : "success"}">${d.status === "active" ? "Disable" : "Enable"}</button></form></div></td></tr>`;
+      }).join("")}</tbody></table></div>
     `), { "Content-Type": "text/html" });
+  }
+
+  if (url.pathname === "/admin/users" && req.method === "POST") {
+    const form = await formBody(req);
+    const email = String(form.email || "").trim().toLowerCase();
+    const password = String(form.password || "");
+    const name = String(form.name || email).trim();
+    if (email && email.includes("@") && password.length >= 6 && !db.users.some((u) => u.email === email)) {
+      db.users.push({ id: id("usr"), email, name, passwordHash: passwordHash(password), status: "active", createdAt: now(), updatedAt: now() });
+      db.audit.push({ at: now(), action: "user.created_by_admin", email });
+      await saveDb(db);
+    }
+    return redirect(res, "/admin/users");
+  }
+
+  const userAction = url.pathname.match(/^\/admin\/users\/([^/]+)\/(update|disable|enable|reset-password)$/);
+  if (userAction && req.method === "POST") {
+    const user = db.users.find((item) => item.id === userAction[1]);
+    if (user) {
+      const form = await formBody(req);
+      if (userAction[2] === "update") {
+        user.name = String(form.name || user.name || user.email);
+      } else if (userAction[2] === "reset-password") {
+        const password = String(form.password || "");
+        if (password.length >= 6) user.passwordHash = passwordHash(password);
+      } else {
+        user.status = userAction[2] === "disable" ? "disabled" : "active";
+      }
+      user.updatedAt = now();
+      db.audit.push({ at: now(), action: `user.${userAction[2]}`, email: user.email });
+      await saveDb(db);
+    }
+    return redirect(res, "/admin/users");
   }
 
   if (url.pathname === "/admin/users") {
     return send(res, 200, page("Users", `
       <h1>Users</h1>
-      <div class="panel"><table><thead><tr><th>Email</th><th>Name</th><th>Status</th><th>Devices</th><th>Created</th></tr></thead><tbody>${db.users.map((u) => {
+      <div class="panel"><h2>Create Portal User</h2><form method="post"><div class="row"><div><label>Email</label><input name="email" type="email" required></div><div><label>Name</label><input name="name"></div><div><label>Password</label><input name="password" type="password" minlength="6" required></div></div><p><button>Create User</button></p></form></div>
+      <div class="panel scroll"><table><thead><tr><th>Email</th><th>Name</th><th>Status</th><th>Devices</th><th>Created</th><th>Remote Actions</th></tr></thead><tbody>${db.users.map((u) => {
         const count = db.devices.filter((d) => d.ownerUserId === u.id).length;
-        return `<tr><td>${escapeHtml(u.email)}</td><td>${escapeHtml(u.name || "")}</td><td>${escapeHtml(u.status || "active")}</td><td>${count}</td><td>${escapeHtml(u.createdAt)}</td></tr>`;
+        return `<tr><td>${escapeHtml(u.email)}</td><td><form method="post" action="/admin/users/${escapeHtml(u.id)}/update"><input name="name" value="${escapeHtml(u.name || "")}"><p><button class="secondary">Save</button></p></form></td><td><span class="pill ${(u.status || "active") === "active" ? "ok" : "bad"}">${escapeHtml(u.status || "active")}</span></td><td>${count}</td><td>${escapeHtml(u.createdAt)}</td><td><div class="stack"><form method="post" action="/admin/users/${escapeHtml(u.id)}/${(u.status || "active") === "active" ? "disable" : "enable"}"><button class="${(u.status || "active") === "active" ? "danger" : "success"}">${(u.status || "active") === "active" ? "Disable" : "Enable"}</button></form><form method="post" action="/admin/users/${escapeHtml(u.id)}/reset-password"><input name="password" type="password" minlength="6" placeholder="New password"><p><button class="warning">Reset Password</button></p></form></div></td></tr>`;
       }).join("")}</tbody></table></div>
     `), { "Content-Type": "text/html" });
   }
@@ -507,11 +589,32 @@ async function admin(req, res, url, db) {
     return redirect(res, "/admin/licenses");
   }
 
+  const licenseAction = url.pathname.match(/^\/admin\/licenses\/([^/]+)\/(update|activate)$/);
+  if (licenseAction && req.method === "POST") {
+    const license = db.licenses.find((item) => item.id === licenseAction[1]);
+    if (license) {
+      if (licenseAction[2] === "update") {
+        const form = await formBody(req);
+        license.plan = String(form.plan || license.plan || "standard");
+        license.vendos = Number(form.vendos || 0);
+        license.desktops = Number(form.desktops || 0);
+        license.charging = form.charging === "on";
+        license.expiresAt = form.neverExpire === "on" ? null : (form.expiresAt || null);
+      } else {
+        license.status = "active";
+      }
+      license.updatedAt = now();
+      db.audit.push({ at: now(), action: `license.${licenseAction[2]}`, key: license.key });
+      await saveDb(db);
+    }
+    return redirect(res, "/admin/licenses");
+  }
+
   if (url.pathname === "/admin/licenses") {
     return send(res, 200, page("Licenses", `
       <h1>Licenses</h1>
-      <div class="panel"><form method="post"><div class="row"><div><label>Device Serial</label><input name="deviceSerial" required></div><div><label>Plan</label><input name="plan" value="standard"></div><div><label>Vendos</label><input name="vendos" type="number" value="1" min="0"></div><div><label>Desktops</label><input name="desktops" type="number" value="0" min="0"></div><div><label>Expires At</label><input name="expiresAt" type="date"></div><div><label>Charging</label><input name="charging" type="checkbox"></div></div><p><button>Create License</button></p></form></div>
-      <div class="panel"><table><thead><tr><th>Key</th><th>Device</th><th>Plan</th><th>Status</th><th>Limits</th><th>Expires</th><th></th></tr></thead><tbody>${db.licenses.map((l) => `<tr><td>${escapeHtml(l.key)}</td><td>${escapeHtml(l.deviceSerial)}</td><td>${escapeHtml(l.plan)}</td><td><span class="pill ${licenseStatus(l) === "active" ? "ok" : "bad"}">${escapeHtml(licenseStatus(l))}</span></td><td>${escapeHtml(l.vendos)} vendos / ${escapeHtml(l.desktops)} desktops</td><td>${escapeHtml(l.expiresAt || "never")}</td><td><form method="post" action="/admin/licenses/${escapeHtml(l.id)}/revoke"><button class="danger">Revoke</button></form></td></tr>`).join("")}</tbody></table></div>
+      <div class="panel"><form method="post"><div class="row"><div><label>Device Serial</label><input name="deviceSerial" list="device-serials" required><datalist id="device-serials">${db.devices.map((d) => `<option value="${escapeHtml(d.serial)}"></option>`).join("")}</datalist></div><div><label>Plan</label><input name="plan" value="standard"></div><div><label>Vendos</label><input name="vendos" type="number" value="1" min="0"></div><div><label>Desktops</label><input name="desktops" type="number" value="0" min="0"></div><div><label>Expires At</label><input name="expiresAt" type="date"><small class="muted">Leave blank for offline never-expire.</small></div><div><label>Charging</label><input name="charging" type="checkbox" checked></div></div><p><button>Create License</button></p></form></div>
+      <div class="panel scroll"><table><thead><tr><th>Key</th><th>Device</th><th>Status</th><th>Edit License</th><th>Sync Policy</th><th>Actions</th></tr></thead><tbody>${db.licenses.map((l) => `<tr><td><code>${escapeHtml(l.key)}</code></td><td>${escapeHtml(l.deviceSerial)}</td><td><span class="pill ${licenseStatus(l) === "active" ? "ok" : "bad"}">${escapeHtml(licenseStatus(l))}</span></td><td><form method="post" action="/admin/licenses/${escapeHtml(l.id)}/update"><div class="row"><div><label class="tiny">Plan</label><input name="plan" value="${escapeHtml(l.plan)}"></div><div><label class="tiny">Vendos</label><input name="vendos" type="number" value="${escapeHtml(l.vendos)}" min="0"></div><div><label class="tiny">Desktops</label><input name="desktops" type="number" value="${escapeHtml(l.desktops)}" min="0"></div><div><label class="tiny">Expires</label><input name="expiresAt" type="date" value="${escapeHtml(l.expiresAt ? String(l.expiresAt).slice(0, 10) : "")}"></div><div><label class="tiny">Never Expire</label><input name="neverExpire" type="checkbox" ${l.expiresAt ? "" : "checked"}></div><div><label class="tiny">Charging</label><input name="charging" type="checkbox" ${l.charging ? "checked" : ""}></div></div><p><button class="secondary">Save</button></p></form></td><td>${escapeHtml(publicLicense(l).syncPolicy)}</td><td><div class="actions">${licenseStatus(l) === "active" ? `<form method="post" action="/admin/licenses/${escapeHtml(l.id)}/revoke"><button class="danger">Revoke</button></form>` : `<form method="post" action="/admin/licenses/${escapeHtml(l.id)}/activate"><button class="success">Activate</button></form>`}<form method="post" action="/admin/operations"><input type="hidden" name="deviceSerial" value="${escapeHtml(l.deviceSerial)}"><input type="hidden" name="command" value="sync-license"><button>Queue Sync</button></form></div></td></tr>`).join("")}</tbody></table></div>
     `), { "Content-Type": "text/html" });
   }
 
@@ -567,6 +670,60 @@ async function admin(req, res, url, db) {
     `), { "Content-Type": "text/html" });
   }
 
+  if (url.pathname === "/admin/operations" && req.method === "POST") {
+    const form = await formBody(req);
+    const deviceSerial = String(form.deviceSerial || "").trim();
+    const command = String(form.command || "").trim();
+    let payload = {};
+    const rawPayload = String(form.payload || "").trim();
+    if (rawPayload) {
+      try {
+        payload = JSON.parse(rawPayload);
+      } catch {
+        payload = { note: rawPayload };
+      }
+    }
+    if (deviceSerial && command) {
+      db.operations.push({
+        id: id("op"),
+        deviceSerial,
+        command,
+        payload,
+        status: "pending",
+        result: null,
+        createdAt: now(),
+        updatedAt: now(),
+        acknowledgedAt: null,
+      });
+      db.audit.push({ at: now(), action: "operation.queued", deviceSerial, command });
+      await saveDb(db);
+    }
+    return redirect(res, "/admin/operations");
+  }
+
+  const operationAction = url.pathname.match(/^\/admin\/operations\/([^/]+)\/(cancel|retry)$/);
+  if (operationAction && req.method === "POST") {
+    const operation = db.operations.find((item) => item.id === operationAction[1]);
+    if (operation) {
+      operation.status = operationAction[2] === "retry" ? "pending" : "cancelled";
+      operation.updatedAt = now();
+      db.audit.push({ at: now(), action: `operation.${operationAction[2]}`, operationId: operation.id });
+      await saveDb(db);
+    }
+    return redirect(res, "/admin/operations");
+  }
+
+  if (url.pathname === "/admin/operations") {
+    const commands = ["sync-license", "reload-portal", "restart-services", "pull-config", "reboot", "custom"];
+    const recent = [...db.operations].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, 200);
+    return send(res, 200, page("Remote Operations", `
+      <h1>Remote Operations</h1>
+      <div class="panel"><p>Queue commands for Orange Pi devices. The device can poll <code>GET /api/v1/devices/:serial/operations</code> using the normal bearer API token, then acknowledge with <code>POST /api/v1/operations/:id/ack</code>.</p></div>
+      <div class="panel"><h2>Queue Command</h2><form method="post"><div class="row"><div><label>Device Serial</label><input name="deviceSerial" list="operation-device-serials" required><datalist id="operation-device-serials">${db.devices.map((d) => `<option value="${escapeHtml(d.serial)}"></option>`).join("")}</datalist></div><div><label>Command</label><select name="command">${commands.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("")}</select></div></div><label>Payload JSON or note</label><textarea name="payload" placeholder='{"service":"nginx"}'></textarea><p><button>Queue Operation</button></p></form></div>
+      <div class="panel scroll"><h2>Recent Operations</h2><table><thead><tr><th>Device</th><th>Command</th><th>Status</th><th>Payload / Result</th><th>Created</th><th>Actions</th></tr></thead><tbody>${recent.map((op) => `<tr><td><code>${escapeHtml(op.deviceSerial)}</code></td><td>${escapeHtml(op.command)}</td><td><span class="pill ${op.status === "done" ? "ok" : op.status === "failed" || op.status === "cancelled" ? "bad" : "warn"}">${escapeHtml(op.status || "pending")}</span></td><td><small>Payload</small><pre>${escapeHtml(JSON.stringify(op.payload || {}, null, 2))}</pre>${op.result ? `<small>Result</small><pre>${escapeHtml(JSON.stringify(op.result, null, 2))}</pre>` : ""}</td><td>${escapeHtml(op.createdAt)}${op.acknowledgedAt ? `<br><small class="muted">Ack: ${escapeHtml(op.acknowledgedAt)}</small>` : ""}</td><td><div class="actions"><form method="post" action="/admin/operations/${escapeHtml(op.id)}/retry"><button>Retry</button></form><form method="post" action="/admin/operations/${escapeHtml(op.id)}/cancel"><button class="danger">Cancel</button></form></div></td></tr>`).join("")}</tbody></table></div>
+    `), { "Content-Type": "text/html" });
+  }
+
   if (url.pathname === "/admin/tokens" && req.method === "POST") {
     const form = await formBody(req);
     const token = crypto.randomBytes(32).toString("base64url");
@@ -611,6 +768,36 @@ async function admin(req, res, url, db) {
         await saveDb(db);
       }
     }
+    if (form.action === "set-account-status") {
+      const account = eload.accounts.find((item) => item.id === form.accountId);
+      if (account) {
+        account.status = String(form.status || "active");
+        account.updatedAt = now();
+        db.audit.push({ at: now(), action: "eload.account.status", accountId: account.id, status: account.status });
+        await saveDb(db);
+      }
+    }
+    if (form.action === "upsert-product") {
+      const code = String(form.code || "").trim().toUpperCase();
+      const price = Number(form.price || 0);
+      if (code && price >= 0) {
+        const networks = String(form.networks || "").split(",").map((item) => item.trim().toLowerCase()).filter(Boolean);
+        let product = eload.products.find((item) => item.code === code);
+        if (!product) {
+          product = eloadProduct(code, String(form.name || code), price, networks, String(form.category || "eload"));
+          eload.products.push(product);
+        }
+        product.name = String(form.name || product.name || code);
+        product.description = String(form.description || product.description || "3DBPoint e-load product");
+        product.category = String(form.category || product.category || "eload");
+        product.price = price;
+        product.status = String(form.status || product.status || "active");
+        product.meta = { ...(product.meta || {}), networks };
+        product.updatedAt = now();
+        db.audit.push({ at: now(), action: "eload.product.upserted", code });
+        await saveDb(db);
+      }
+    }
     return redirect(res, "/admin/eload");
   }
 
@@ -628,12 +815,31 @@ async function admin(req, res, url, db) {
       </div>
       <div class="panel">
         <h2>Accounts / Balance</h2>
-        <table><thead><tr><th>Name</th><th>API Key</th><th>Balance</th><th>Status</th><th>Add Balance</th></tr></thead><tbody>${eload.accounts.map((a) => `<tr><td>${escapeHtml(a.name)}</td><td><code>${escapeHtml(a.apiKey)}</code></td><td>${Number(a.balance || 0).toFixed(2)}</td><td>${escapeHtml(a.status)}</td><td><form method="post" style="display:flex;gap:8px"><input type="hidden" name="action" value="add-balance"><input type="hidden" name="accountId" value="${escapeHtml(a.id)}"><input name="amount" type="number" step="0.01" min="0" placeholder="Amount"><button>Add</button></form></td></tr>`).join("")}</tbody></table>
+        <table><thead><tr><th>Name</th><th>API Key</th><th>Balance</th><th>Status</th><th>Remote Actions</th></tr></thead><tbody>${eload.accounts.map((a) => `<tr><td>${escapeHtml(a.name)}</td><td><code>${escapeHtml(a.apiKey)}</code></td><td>${Number(a.balance || 0).toFixed(2)}</td><td><span class="pill ${a.status === "active" ? "ok" : "bad"}">${escapeHtml(a.status)}</span></td><td><div class="stack"><form method="post" style="display:flex;gap:8px"><input type="hidden" name="action" value="add-balance"><input type="hidden" name="accountId" value="${escapeHtml(a.id)}"><input name="amount" type="number" step="0.01" min="0" placeholder="Amount"><button>Add Balance</button></form><form method="post" class="actions"><input type="hidden" name="action" value="set-account-status"><input type="hidden" name="accountId" value="${escapeHtml(a.id)}"><select name="status" style="max-width:140px"><option value="active" ${a.status === "active" ? "selected" : ""}>active</option><option value="disabled" ${a.status === "disabled" ? "selected" : ""}>disabled</option></select><button class="secondary">Set</button></form></div></td></tr>`).join("")}</tbody></table>
       </div>
       <div class="panel">
-        <h2>Products</h2>
-        <table><thead><tr><th>Code</th><th>Name</th><th>Price</th><th>Networks</th></tr></thead><tbody>${eload.products.map((p) => `<tr><td>${escapeHtml(p.code)}</td><td>${escapeHtml(p.name)}</td><td>${Number(p.price || 0).toFixed(2)}</td><td>${escapeHtml((p.meta?.networks || []).join(", "))}</td></tr>`).join("")}</tbody></table>
+        <h2>Add / Update Product</h2>
+        <form method="post"><input type="hidden" name="action" value="upsert-product"><div class="row"><div><label>Code</label><input name="code" required placeholder="GLOBE10"></div><div><label>Name</label><input name="name" required></div><div><label>Price</label><input name="price" type="number" step="0.01" min="0" required></div><div><label>Category</label><input name="category" value="eload"></div><div><label>Networks</label><input name="networks" placeholder="globe,tm"></div><div><label>Status</label><select name="status"><option value="active">active</option><option value="disabled">disabled</option></select></div></div><label>Description</label><input name="description" value="3DBPoint e-load product"><p><button>Save Product</button></p></form>
       </div>
+      <div class="panel scroll">
+        <h2>Products</h2>
+        <table><thead><tr><th>Code</th><th>Name</th><th>Price</th><th>Status</th><th>Networks</th><th>Edit</th></tr></thead><tbody>${eload.products.map((p) => `<tr><td><code>${escapeHtml(p.code)}</code></td><td>${escapeHtml(p.name)}</td><td>${Number(p.price || 0).toFixed(2)}</td><td><span class="pill ${p.status === "active" ? "ok" : "bad"}">${escapeHtml(p.status)}</span></td><td>${escapeHtml((p.meta?.networks || []).join(", "))}</td><td><form method="post"><input type="hidden" name="action" value="upsert-product"><input type="hidden" name="code" value="${escapeHtml(p.code)}"><input name="name" value="${escapeHtml(p.name)}"><input name="price" type="number" step="0.01" min="0" value="${escapeHtml(p.price)}"><input name="category" value="${escapeHtml(p.category)}"><input name="networks" value="${escapeHtml((p.meta?.networks || []).join(", "))}"><select name="status"><option value="active" ${p.status === "active" ? "selected" : ""}>active</option><option value="disabled" ${p.status === "disabled" ? "selected" : ""}>disabled</option></select><input name="description" value="${escapeHtml(p.description || "")}"><p><button class="secondary">Update</button></p></form></td></tr>`).join("")}</tbody></table>
+      </div>
+      <div class="panel scroll">
+        <h2>Recent Orders</h2>
+        <table><thead><tr><th>ID</th><th>Account</th><th>Product</th><th>Recipient</th><th>Amount</th><th>Status</th><th>Created</th></tr></thead><tbody>${[...eload.orders].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt))).slice(0, 100).map((o) => {
+          const account = eload.accounts.find((a) => a.id === o.accountId);
+          return `<tr><td><code>${escapeHtml(o.id)}</code></td><td>${escapeHtml(account?.name || o.accountId || "")}</td><td>${escapeHtml(o.productCode)}</td><td>${escapeHtml(o.recipient)}</td><td>${Number(o.amount || 0).toFixed(2)}</td><td><span class="pill ${o.status === "success" ? "ok" : "warn"}">${escapeHtml(o.status)}</span></td><td>${escapeHtml(o.createdAt)}</td></tr>`;
+        }).join("")}</tbody></table>
+      </div>
+    `), { "Content-Type": "text/html" });
+  }
+
+  if (url.pathname === "/admin/audit") {
+    const events = [...db.audit].sort((a, b) => String(b.at).localeCompare(String(a.at))).slice(0, 500);
+    return send(res, 200, page("Audit", `
+      <h1>Audit Log</h1>
+      <div class="panel scroll"><table><thead><tr><th>Time</th><th>Action</th><th>Details</th></tr></thead><tbody>${events.map((event) => `<tr><td>${escapeHtml(event.at)}</td><td><span class="pill">${escapeHtml(event.action)}</span></td><td><pre>${escapeHtml(JSON.stringify(Object.fromEntries(Object.entries(event).filter(([key]) => key !== "at" && key !== "action")), null, 2))}</pre></td></tr>`).join("")}</tbody></table></div>
     `), { "Content-Type": "text/html" });
   }
 
@@ -652,7 +858,9 @@ POST /api/v1/devices/register
 GET  /api/v1/devices/:serial/license
 POST /api/v1/licenses/validate
 GET  /api/v1/chats/messages?deviceSerial=...
-POST /api/v1/chats/messages</pre>
+POST /api/v1/chats/messages
+GET  /api/v1/devices/:serial/operations
+POST /api/v1/operations/:id/ack</pre>
       </div>
     `), { "Content-Type": "text/html" });
   }
@@ -850,6 +1058,54 @@ async function api(req, res, url, db) {
 
   if (!(await requireApiToken(req, db))) {
     return json(res, 401, { error: { code: "unauthorized", message: "Missing or invalid bearer token" } });
+  }
+
+  const deviceOperations = url.pathname.match(/^\/api\/v1\/devices\/([^/]+)\/operations$/);
+  if (deviceOperations && req.method === "GET") {
+    const serial = decodeURIComponent(deviceOperations[1]);
+    const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 20)));
+    const operations = db.operations
+      .filter((operation) => operation.deviceSerial === serial && (operation.status || "pending") === "pending")
+      .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)))
+      .slice(0, limit)
+      .map(publicOperation);
+    const device = db.devices.find((item) => item.serial === serial);
+    if (device) {
+      device.lastSeenAt = now();
+      device.updatedAt = now();
+      await saveDb(db);
+    }
+    return json(res, 200, { data: { operations } });
+  }
+
+  const operationAck = url.pathname.match(/^\/api\/v1\/operations\/([^/]+)\/ack$/);
+  if (operationAck && req.method === "POST") {
+    const body = await jsonBody(req);
+    const operation = db.operations.find((item) => item.id === operationAck[1]);
+    if (!operation) return json(res, 404, { error: { code: "not_found", message: "Operation not found" } });
+    operation.status = String(body.status || "done");
+    operation.result = body.result || null;
+    operation.acknowledgedAt = now();
+    operation.updatedAt = now();
+    db.audit.push({ at: now(), action: "operation.acknowledged", operationId: operation.id, status: operation.status });
+    await saveDb(db);
+    return json(res, 200, { data: publicOperation(operation) });
+  }
+
+  if (url.pathname === "/api/v1/admin/summary" && req.method === "GET") {
+    ensureEload(db);
+    return json(res, 200, {
+      data: {
+        devices: db.devices.length,
+        users: db.users.length,
+        licenses: db.licenses.length,
+        activeLicenses: db.licenses.filter((license) => licenseStatus(license) === "active").length,
+        pendingOperations: db.operations.filter((operation) => (operation.status || "pending") === "pending").length,
+        unreadChats: db.chats.filter((m) => m.status === "unread" && !m.senderAdmin).length,
+        eloadBalance: db.eload.accounts.reduce((sum, account) => sum + Number(account.balance || 0), 0),
+        eloadOrders: db.eload.orders.length,
+      },
+    });
   }
 
   if (url.pathname === "/api/v1/devices/register" && req.method === "POST") {

@@ -36,7 +36,25 @@ DATA_DIR=/data
 6. Deploy.
 7. Open `https://cpanel.3dbpoint.com/login`.
 8. Create an API token at `API Tokens`.
-9. Register devices and create licenses in the admin console.
+9. Register devices, create licenses, manage e-load, answer chats, and queue remote device operations in the admin console.
+
+## Remote Admin Web UI
+
+Open:
+
+```text
+https://cpanel.3dbpoint.com/login
+```
+
+Remote admin pages:
+
+- `Devices` — bind owners, enable/disable devices, and queue sync/reload commands.
+- `Users` — create portal users, disable/enable accounts, and reset passwords.
+- `Licenses` — create, edit, revoke, reactivate, and set never-expire or dated license expiry.
+- `Operations` — queue Orange Pi commands such as `sync-license`, `reload-portal`, `restart-services`, `pull-config`, and `reboot`.
+- `Chats` — read portal user messages and send admin replies.
+- `E-Load` — create provider credentials, add balance, enable/disable accounts, manage products, and view orders.
+- `Audit` — view recent admin/API activity.
 
 ## API
 
@@ -54,6 +72,8 @@ GET  /api/v1/status
 POST /api/v1/devices/register
 GET  /api/v1/devices/:serial/license
 POST /api/v1/licenses/validate
+GET  /api/v1/devices/:serial/operations
+POST /api/v1/operations/:id/ack
 ```
 
 ## E-Load Provider API
