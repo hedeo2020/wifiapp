@@ -51,6 +51,7 @@ Remote admin pages:
 - `Devices` — bind owners, enable/disable devices, and queue sync/reload commands.
 - `Users` — create portal users, disable/enable accounts, and reset passwords.
 - `Licenses` — create, edit, revoke, reactivate, and set never-expire or dated license expiry.
+- `Remote IP` — create a public/global URL for an Orange Pi only when that device already has an active license.
 - `Operations` — queue Orange Pi commands such as `sync-license`, `reload-portal`, `restart-services`, `pull-config`, and `reboot`.
 - `Chats` — read portal user messages and send admin replies.
 - `E-Load` — create provider credentials, add balance, enable/disable accounts, manage products, and view orders.
@@ -72,9 +73,15 @@ GET  /api/v1/status
 POST /api/v1/devices/register
 GET  /api/v1/devices/:serial/license
 POST /api/v1/licenses/validate
+GET  /api/v1/devices/:serial/remote-access
 GET  /api/v1/devices/:serial/operations
 POST /api/v1/operations/:id/ack
 ```
+
+Remote IP URLs are created from the admin console at `/admin/remotes`.
+They are license-gated. If a device has no active license, the API refuses
+to create the remote URL; if the license is later revoked or expired, the
+public `/r/:slug` page is blocked.
 
 ## E-Load Provider API
 
