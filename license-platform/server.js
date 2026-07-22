@@ -37,6 +37,8 @@ async function loadDb() {
     const seed = {
       devices: [],
       licenses: [],
+      users: [],
+      chats: [],
       eload: {
         accounts: [
           {
@@ -93,6 +95,17 @@ function ensureEload(db) {
   }
   if (db.eload.products.length === 0) db.eload.products = defaultEloadProducts();
   return db.eload;
+}
+
+function ensureCore(db) {
+  db.devices ||= [];
+  db.licenses ||= [];
+  db.users ||= [];
+  db.chats ||= [];
+  db.apiTokens ||= [];
+  db.audit ||= [];
+  ensureEload(db);
+  return db;
 }
 
 function defaultEloadProducts() {
@@ -296,8 +309,70 @@ function publicLicense(license) {
     desktops: Number(license.desktops || 0),
     charging: Boolean(license.charging),
     expiresAt: license.expiresAt || null,
+    syncPolicy: license.expiresAt ? "expires_at" : "never_expire_offline",
     issuedAt: license.issuedAt,
     updatedAt: license.updatedAt,
+  };
+}
+
+function passwordHash(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  return `pbkdf2:${salt}:${crypto.pbkdf2Sync(String(password), salt, 120000, 32, "sha256").toString("hex")}`;
+}
+
+function verifyPassword(password, stored) {
+  const [kind, salt, hash] = String(stored || "").split(":");
+  if (kind !== "pbkdf2" || !salt || !hash) return false;
+  const check = crypto.pbkdf2Sync(String(password), salt, 120000, 32, "sha256").toString("hex");
+  return timingSafeEqual(check, hash);
+}
+
+function publicUser(user) {
+  return {
+    id: user.id,
+    email: user.email,
+    name: user.name || "",
+    status: user.status || "active",
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt,
+  };
+}
+
+function deviceRegistrationPayload(user, device, license, token = "") {
+  return {
+    owner: {
+      id: user.id,
+      email: user.email,
+      name: user.name || user.email,
+      bearerToken: token,
+    },
+    device,
+    license: license ? {
+      licenseType: "LICENSED",
+      license: license.key,
+      status: licenseStatus(license),
+      expirationDate: license.expiresAt || "",
+      expiresAt: license.expiresAt || null,
+      licenseMeta: {
+        charging: Boolean(license.charging),
+        vendos: Number(license.vendos || 0),
+        desktops: Number(license.desktops || 0),
+      },
+    } : null,
+  };
+}
+
+function publicChatMessage(message) {
+  return {
+    id: message.id,
+    deviceSerial: message.deviceSerial,
+    user: message.user || null,
+    sender: message.sender,
+    senderAdmin: Boolean(message.senderAdmin),
+    message: message.message,
+    status: message.status || "unread",
+    createdAt: message.createdAt,
+    updatedAt: message.updatedAt,
   };
 }
 
@@ -323,7 +398,7 @@ function page(title, body) {
   </style>
 </head>
 <body>
-<header><div class="top"><div class="brand">3DBPoint CPanel</div><nav><a href="/">Dashboard</a><a href="/admin/devices">Devices</a><a href="/admin/licenses">Licenses</a><a href="/admin/eload">E-Load</a><a href="/admin/tokens">API Tokens</a><a href="/docs">Docs</a><form method="post" action="/logout" style="display:inline"><button class="secondary" style="padding:6px 9px;margin-left:12px">Logout</button></form></nav></div></header>
+<header><div class="top"><div class="brand">3DBPoint CPanel</div><nav><a href="/">Dashboard</a><a href="/admin/devices">Devices</a><a href="/admin/licenses">Licenses</a><a href="/admin/users">Users</a><a href="/admin/chats">Chats</a><a href="/admin/eload">E-Load</a><a href="/admin/tokens">API Tokens</a><a href="/docs">Docs</a><form method="post" action="/logout" style="display:inline"><button class="secondary" style="padding:6px 9px;margin-left:12px">Logout</button></form></nav></div></header>
 <main class="wrap">${body}</main>
 </body></html>`;
 }
@@ -333,6 +408,7 @@ function loginPage(message = "") {
 }
 
 async function admin(req, res, url, db) {
+  ensureCore(db);
   if (url.pathname === "/login" && req.method === "GET") return send(res, 200, loginPage(), { "Content-Type": "text/html" });
   if (url.pathname === "/login" && req.method === "POST") {
     const form = await formBody(req);
@@ -361,6 +437,8 @@ async function admin(req, res, url, db) {
         <div class="card"><div class="metric">${active}</div><div class="muted">Active Licenses</div></div>
         <div class="card"><div class="metric">${balance.toFixed(2)}</div><div class="muted">E-Load Balance</div></div>
         <div class="card"><div class="metric">${db.apiTokens.length}</div><div class="muted">API Tokens</div></div>
+        <div class="card"><div class="metric">${db.users.length}</div><div class="muted">Users</div></div>
+        <div class="card"><div class="metric">${db.chats.filter((m) => m.status === "unread" && !m.senderAdmin).length}</div><div class="muted">Unread Chats</div></div>
       </div>
       <div class="panel"><h2>Domains</h2><p><b>API:</b> ${escapeHtml(env.publicApiUrl)}</p><p><b>Admin:</b> ${escapeHtml(env.publicAdminUrl)}</p></div>
     `), { "Content-Type": "text/html" });
@@ -382,6 +460,16 @@ async function admin(req, res, url, db) {
       <h1>Devices</h1>
       <div class="panel"><form method="post"><div class="row"><div><label>Serial</label><input name="serial" required></div><div><label>Name</label><input name="name"></div></div><p><button>Add Device</button></p></form></div>
       <div class="panel"><table><thead><tr><th>Serial</th><th>Name</th><th>Status</th><th>Last Seen</th><th>Created</th></tr></thead><tbody>${db.devices.map((d) => `<tr><td>${escapeHtml(d.serial)}</td><td>${escapeHtml(d.name)}</td><td>${escapeHtml(d.status)}</td><td>${escapeHtml(d.lastSeenAt || "")}</td><td>${escapeHtml(d.createdAt)}</td></tr>`).join("")}</tbody></table></div>
+    `), { "Content-Type": "text/html" });
+  }
+
+  if (url.pathname === "/admin/users") {
+    return send(res, 200, page("Users", `
+      <h1>Users</h1>
+      <div class="panel"><table><thead><tr><th>Email</th><th>Name</th><th>Status</th><th>Devices</th><th>Created</th></tr></thead><tbody>${db.users.map((u) => {
+        const count = db.devices.filter((d) => d.ownerUserId === u.id).length;
+        return `<tr><td>${escapeHtml(u.email)}</td><td>${escapeHtml(u.name || "")}</td><td>${escapeHtml(u.status || "active")}</td><td>${count}</td><td>${escapeHtml(u.createdAt)}</td></tr>`;
+      }).join("")}</tbody></table></div>
     `), { "Content-Type": "text/html" });
   }
 
@@ -424,6 +512,58 @@ async function admin(req, res, url, db) {
       <h1>Licenses</h1>
       <div class="panel"><form method="post"><div class="row"><div><label>Device Serial</label><input name="deviceSerial" required></div><div><label>Plan</label><input name="plan" value="standard"></div><div><label>Vendos</label><input name="vendos" type="number" value="1" min="0"></div><div><label>Desktops</label><input name="desktops" type="number" value="0" min="0"></div><div><label>Expires At</label><input name="expiresAt" type="date"></div><div><label>Charging</label><input name="charging" type="checkbox"></div></div><p><button>Create License</button></p></form></div>
       <div class="panel"><table><thead><tr><th>Key</th><th>Device</th><th>Plan</th><th>Status</th><th>Limits</th><th>Expires</th><th></th></tr></thead><tbody>${db.licenses.map((l) => `<tr><td>${escapeHtml(l.key)}</td><td>${escapeHtml(l.deviceSerial)}</td><td>${escapeHtml(l.plan)}</td><td><span class="pill ${licenseStatus(l) === "active" ? "ok" : "bad"}">${escapeHtml(licenseStatus(l))}</span></td><td>${escapeHtml(l.vendos)} vendos / ${escapeHtml(l.desktops)} desktops</td><td>${escapeHtml(l.expiresAt || "never")}</td><td><form method="post" action="/admin/licenses/${escapeHtml(l.id)}/revoke"><button class="danger">Revoke</button></form></td></tr>`).join("")}</tbody></table></div>
+    `), { "Content-Type": "text/html" });
+  }
+
+  if (url.pathname === "/admin/chats" && req.method === "POST") {
+    const form = await formBody(req);
+    const deviceSerial = String(form.deviceSerial || "").trim();
+    const message = String(form.message || "").trim();
+    if (deviceSerial && message) {
+      const device = db.devices.find((d) => d.serial === deviceSerial);
+      const user = device?.ownerUserId ? db.users.find((u) => u.id === device.ownerUserId) : null;
+      db.chats.push({
+        id: id("msg"),
+        deviceSerial,
+        user: user ? { id: user.id, email: user.email, name: user.name || "" } : null,
+        sender: "admin",
+        senderAdmin: true,
+        message,
+        status: "unread",
+        createdAt: now(),
+        updatedAt: now(),
+      });
+      db.audit.push({ at: now(), action: "chat.admin.sent", deviceSerial });
+      await saveDb(db);
+    }
+    return redirect(res, `/admin/chats${deviceSerial ? `?deviceSerial=${encodeURIComponent(deviceSerial)}` : ""}`);
+  }
+
+  if (url.pathname === "/admin/chats") {
+    const selected = String(url.searchParams.get("deviceSerial") || "").trim();
+    const devicesWithChats = [...new Set([
+      ...db.chats.map((m) => m.deviceSerial).filter(Boolean),
+      ...db.devices.map((d) => d.serial).filter(Boolean),
+    ])].sort();
+    const shown = selected || devicesWithChats[0] || "";
+    const messages = db.chats.filter((m) => !shown || m.deviceSerial === shown).sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+    for (const m of messages) {
+      if (!m.senderAdmin && m.status === "unread") {
+        m.status = "read";
+        m.updatedAt = now();
+      }
+    }
+    await saveDb(db);
+    return send(res, 200, page("Chats", `
+      <h1>Chats</h1>
+      <div class="panel">
+        <form method="get" action="/admin/chats"><label>Device/User</label><select name="deviceSerial" onchange="this.form.submit()">${devicesWithChats.map((serial) => `<option value="${escapeHtml(serial)}" ${serial === shown ? "selected" : ""}>${escapeHtml(serial)}</option>`).join("")}</select></form>
+      </div>
+      <div class="panel">
+        <h2>${shown ? `Conversation: ${escapeHtml(shown)}` : "No conversations yet"}</h2>
+        <div>${messages.map((m) => `<p><span class="pill ${m.senderAdmin ? "ok" : ""}">${m.senderAdmin ? "Admin" : escapeHtml(m.user?.email || "User")}</span> ${escapeHtml(m.message)}<br><small class="muted">${escapeHtml(m.createdAt)}</small></p>`).join("")}</div>
+        ${shown ? `<form method="post"><input type="hidden" name="deviceSerial" value="${escapeHtml(shown)}"><label>Admin message</label><input name="message" placeholder="Type reply to this user"><p><button>Send Message</button></p></form>` : ""}
+      </div>
     `), { "Content-Type": "text/html" });
   }
 
@@ -505,9 +645,14 @@ async function admin(req, res, url, db) {
         <p>Use <code>Authorization: Bearer &lt;token&gt;</code> for protected endpoints.</p>
         <pre>GET  /health
 GET  /api/v1/status
+POST /api/v1/auth/register
+POST /api/v1/auth/login
+POST /api/v1/devices/register-user
 POST /api/v1/devices/register
 GET  /api/v1/devices/:serial/license
-POST /api/v1/licenses/validate</pre>
+POST /api/v1/licenses/validate
+GET  /api/v1/chats/messages?deviceSerial=...
+POST /api/v1/chats/messages</pre>
       </div>
     `), { "Content-Type": "text/html" });
   }
@@ -516,7 +661,87 @@ POST /api/v1/licenses/validate</pre>
 }
 
 async function api(req, res, url, db) {
+  ensureCore(db);
   if (url.pathname === "/api/v1/status") return json(res, 200, { data: { status: "ok", service: "3dbpoint-license-platform", time: now() } });
+
+  if ((url.pathname === "/api/v1/auth/register" || url.pathname === "/api/v1/users/register") && req.method === "POST") {
+    const body = await jsonBody(req);
+    const email = String(body.email || "").trim().toLowerCase();
+    const password = String(body.password || "");
+    const name = String(body.name || email).trim();
+    if (!email || !email.includes("@")) return json(res, 422, { error: { code: "validation_error", message: "Valid email is required" } });
+    if (password.length < 6) return json(res, 422, { error: { code: "validation_error", message: "Password must be at least 6 characters" } });
+    let user = db.users.find((u) => u.email === email);
+    if (user) return json(res, 409, { error: { code: "email_taken", message: "Email is already registered" } });
+    user = { id: id("usr"), email, name, passwordHash: passwordHash(password), status: "active", createdAt: now(), updatedAt: now() };
+    db.users.push(user);
+    db.audit.push({ at: now(), action: "user.created", email });
+    await saveDb(db);
+    return json(res, 201, { data: { user: publicUser(user) } });
+  }
+
+  if (url.pathname === "/api/v1/auth/login" && req.method === "POST") {
+    const body = await jsonBody(req);
+    const email = String(body.email || "").trim().toLowerCase();
+    const password = String(body.password || "");
+    const user = db.users.find((u) => u.email === email && u.status !== "disabled");
+    if (!user || !verifyPassword(password, user.passwordHash)) return json(res, 401, { error: { code: "invalid_credentials", message: "Invalid email or password" } });
+    return json(res, 200, { data: { user: publicUser(user) } });
+  }
+
+  if (url.pathname === "/api/v1/devices/register-user" && req.method === "POST") {
+    const body = await jsonBody(req);
+    const serial = String(body.serial || body.deviceId || "").trim();
+    const email = String(body.email || "").trim().toLowerCase();
+    const password = String(body.password || "");
+    const name = String(body.name || email).trim();
+    if (!serial) return json(res, 422, { error: { code: "validation_error", message: "serial is required" } });
+    if (!email || !email.includes("@")) return json(res, 422, { error: { code: "validation_error", message: "Valid email is required" } });
+    if (password.length < 6) return json(res, 422, { error: { code: "validation_error", message: "Password must be at least 6 characters" } });
+
+    let user = db.users.find((u) => u.email === email);
+    if (!user) {
+      user = { id: id("usr"), email, name, passwordHash: passwordHash(password), status: "active", createdAt: now(), updatedAt: now() };
+      db.users.push(user);
+      db.audit.push({ at: now(), action: "user.created_from_device", email, serial });
+    } else if (!verifyPassword(password, user.passwordHash)) {
+      return json(res, 401, { error: { code: "invalid_credentials", message: "Invalid email or password" } });
+    }
+
+    let device = db.devices.find((item) => item.serial === serial);
+    if (!device) {
+      device = { id: id("dev"), serial, name: body.deviceName || serial, status: "active", ownerUserId: user.id, createdAt: now(), updatedAt: now(), lastSeenAt: now() };
+      db.devices.push(device);
+    } else {
+      device.ownerUserId = user.id;
+      device.status = "active";
+      device.lastSeenAt = now();
+      device.updatedAt = now();
+      if (body.deviceName) device.name = String(body.deviceName);
+    }
+
+    let license = db.licenses.find((item) => item.deviceSerial === serial && licenseStatus(item) === "active") || null;
+    if (!license) {
+      license = {
+        id: id("lic"),
+        key: `3DB-${crypto.randomBytes(4).toString("hex").toUpperCase()}-${crypto.randomBytes(4).toString("hex").toUpperCase()}`,
+        deviceSerial: serial,
+        plan: "self-registered",
+        vendos: 1,
+        desktops: 0,
+        charging: true,
+        status: "active",
+        expiresAt: null,
+        issuedAt: now(),
+        updatedAt: now(),
+      };
+      db.licenses.push(license);
+      db.audit.push({ at: now(), action: "license.auto_created_from_user_registration", key: license.key, serial });
+    }
+    db.audit.push({ at: now(), action: "device.registered_by_user", serial, email });
+    await saveDb(db);
+    return json(res, 200, { data: deviceRegistrationPayload(user, device, license) });
+  }
 
   const eloadRoute = url.pathname === "/api/v1/wallets"
     || url.pathname === "/api/v1/account/status"
@@ -642,6 +867,57 @@ async function api(req, res, url, db) {
     }
     await saveDb(db);
     return json(res, 200, { data: device });
+  }
+
+  if (url.pathname === "/api/v1/chats/messages" && req.method === "GET") {
+    const deviceSerial = String(url.searchParams.get("deviceSerial") || "").trim();
+    if (!deviceSerial) return json(res, 422, { error: { code: "validation_error", message: "deviceSerial is required" } });
+    const messages = db.chats
+      .filter((m) => m.deviceSerial === deviceSerial)
+      .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)))
+      .map(publicChatMessage);
+    return json(res, 200, { data: { messages } });
+  }
+
+  if (url.pathname === "/api/v1/chats/messages" && req.method === "POST") {
+    const body = await jsonBody(req);
+    const deviceSerial = String(body.deviceSerial || "").trim();
+    const message = String(body.message || "").trim();
+    const senderAdmin = Boolean(body.senderAdmin);
+    if (!deviceSerial) return json(res, 422, { error: { code: "validation_error", message: "deviceSerial is required" } });
+    if (!message) return json(res, 422, { error: { code: "validation_error", message: "message is required" } });
+    const device = db.devices.find((d) => d.serial === deviceSerial);
+    const user = device?.ownerUserId ? db.users.find((u) => u.id === device.ownerUserId) : null;
+    const chat = {
+      id: id("msg"),
+      deviceSerial,
+      user: user ? { id: user.id, email: user.email, name: user.name || "" } : null,
+      sender: senderAdmin ? "admin" : (user?.email || "portal-user"),
+      senderAdmin,
+      message,
+      status: "unread",
+      createdAt: now(),
+      updatedAt: now(),
+    };
+    db.chats.push(chat);
+    db.audit.push({ at: now(), action: senderAdmin ? "chat.admin.sent_api" : "chat.user.sent_api", deviceSerial });
+    await saveDb(db);
+    return json(res, 201, { data: publicChatMessage(chat) });
+  }
+
+  if (url.pathname === "/api/v1/chats/messages/read" && req.method === "POST") {
+    const body = await jsonBody(req);
+    const deviceSerial = String(body.deviceSerial || "").trim();
+    const forAdmin = Boolean(body.forAdmin);
+    for (const m of db.chats) {
+      if (deviceSerial && m.deviceSerial !== deviceSerial) continue;
+      if (forAdmin && m.senderAdmin) continue;
+      if (!forAdmin && !m.senderAdmin) continue;
+      m.status = "read";
+      m.updatedAt = now();
+    }
+    await saveDb(db);
+    return json(res, 200, { data: { status: "OK" } });
   }
 
   const deviceLicense = url.pathname.match(/^\/api\/v1\/devices\/([^/]+)\/license$/);
