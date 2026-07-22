@@ -13,6 +13,8 @@ const env = {
   defaultApiToken: process.env.DEFAULT_API_TOKEN || "dev-token-change-me",
   publicApiUrl: process.env.PUBLIC_API_URL || "https://api.3dbpoint.com",
   publicAdminUrl: process.env.PUBLIC_ADMIN_URL || "https://cpanel.3dbpoint.com",
+  defaultEloadApiKey: process.env.ELOAD_API_KEY || "3dbpoint-demo-key",
+  defaultEloadApiSecret: process.env.ELOAD_API_SECRET || "3dbpoint-demo-secret-change-me",
 };
 
 const dbPath = path.join(env.dataDir, "db.json");
@@ -35,6 +37,22 @@ async function loadDb() {
     const seed = {
       devices: [],
       licenses: [],
+      eload: {
+        accounts: [
+          {
+            id: id("elo"),
+            name: "Default 3DBPointLabs account",
+            apiKey: env.defaultEloadApiKey,
+            apiSecret: env.defaultEloadApiSecret,
+            balance: 0,
+            status: "active",
+            createdAt: now(),
+            updatedAt: now(),
+          },
+        ],
+        products: defaultEloadProducts(),
+        orders: [],
+      },
       apiTokens: [
         {
           id: id("tok"),
@@ -54,6 +72,54 @@ async function loadDb() {
 async function saveDb(db) {
   await fs.mkdir(env.dataDir, { recursive: true });
   await fs.writeFile(dbPath, JSON.stringify(db, null, 2));
+}
+
+function ensureEload(db) {
+  db.eload ||= {};
+  db.eload.accounts ||= [];
+  db.eload.products ||= defaultEloadProducts();
+  db.eload.orders ||= [];
+  if (db.eload.accounts.length === 0) {
+    db.eload.accounts.push({
+      id: id("elo"),
+      name: "Default 3DBPointLabs account",
+      apiKey: env.defaultEloadApiKey,
+      apiSecret: env.defaultEloadApiSecret,
+      balance: 0,
+      status: "active",
+      createdAt: now(),
+      updatedAt: now(),
+    });
+  }
+  if (db.eload.products.length === 0) db.eload.products = defaultEloadProducts();
+  return db.eload;
+}
+
+function defaultEloadProducts() {
+  return [
+    eloadProduct("SMART10", "Smart Regular Load 10", 10, ["smart", "tnt"]),
+    eloadProduct("SMART20", "Smart Regular Load 20", 20, ["smart", "tnt"]),
+    eloadProduct("SMART50", "Smart Regular Load 50", 50, ["smart", "tnt"]),
+    eloadProduct("GLOBE10", "Globe Regular Load 10", 10, ["globe", "tm"]),
+    eloadProduct("GLOBE20", "Globe Regular Load 20", 20, ["globe", "tm"]),
+    eloadProduct("GLOBE50", "Globe Regular Load 50", 50, ["globe", "tm"]),
+    eloadProduct("DITO10", "DITO Regular Load 10", 10, ["dito"]),
+    eloadProduct("DITO20", "DITO Regular Load 20", 20, ["dito"]),
+  ];
+}
+
+function eloadProduct(code, name, price, networks, category = "eload") {
+  return {
+    id: code.toLowerCase(),
+    code,
+    name,
+    description: "3DBPoint e-load product",
+    category,
+    price,
+    currency: "PHP",
+    status: "active",
+    meta: { networks },
+  };
 }
 
 function send(res, status, body, headers = {}) {
@@ -151,6 +217,66 @@ async function requireApiToken(req, db) {
   return true;
 }
 
+function md5(value) {
+  return crypto.createHash("md5").update(String(value)).digest("hex");
+}
+
+async function requireEloadAccount(req, db, rawBody = "") {
+  const eload = ensureEload(db);
+  const bearer = (req.headers.authorization || "").startsWith("Bearer ")
+    ? (req.headers.authorization || "").slice(7).trim()
+    : "";
+  if (bearer) {
+    const found = eload.accounts.find((account) => account.status === "active" && timingSafeEqual(account.apiKey, bearer));
+    if (found) {
+      found.lastUsedAt = now();
+      await saveDb(db);
+      return found;
+    }
+  }
+
+  const key = String(req.headers["x-access-key"] || "");
+  const nonce = String(req.headers["x-access-nonce"] || "");
+  const signature = String(req.headers["x-access-signature"] || "");
+  if (!key || !nonce || !signature) return null;
+
+  const account = eload.accounts.find((entry) => entry.status === "active" && timingSafeEqual(entry.apiKey, key));
+  if (!account) return null;
+  const expected = md5(md5(nonce) + md5(rawBody || "") + md5(account.apiKey + account.apiSecret));
+  if (!timingSafeEqual(signature, expected)) return null;
+  account.lastUsedAt = now();
+  await saveDb(db);
+  return account;
+}
+
+function publicEloadAccount(account) {
+  return {
+    id: account.id,
+    name: account.name,
+    apiKey: account.apiKey,
+    balance: Number(account.balance || 0),
+    status: account.status,
+    createdAt: account.createdAt,
+    updatedAt: account.updatedAt,
+    lastUsedAt: account.lastUsedAt || null,
+  };
+}
+
+function publicOrder(order) {
+  return {
+    id: order.id,
+    transactionId: order.id,
+    status: order.status,
+    productCode: order.productCode,
+    recipient: order.recipient,
+    amount: Number(order.amount || 0),
+    currency: order.currency || "PHP",
+    clientReference: order.clientReference || null,
+    createdAt: order.createdAt,
+    updatedAt: order.updatedAt,
+  };
+}
+
 function licenseStatus(license) {
   if (!license) return "missing";
   if (license.status !== "active") return license.status;
@@ -197,7 +323,7 @@ function page(title, body) {
   </style>
 </head>
 <body>
-<header><div class="top"><div class="brand">3DBPoint License CPanel</div><nav><a href="/">Dashboard</a><a href="/admin/devices">Devices</a><a href="/admin/licenses">Licenses</a><a href="/admin/tokens">API Tokens</a><a href="/docs">Docs</a><form method="post" action="/logout" style="display:inline"><button class="secondary" style="padding:6px 9px;margin-left:12px">Logout</button></form></nav></div></header>
+<header><div class="top"><div class="brand">3DBPoint CPanel</div><nav><a href="/">Dashboard</a><a href="/admin/devices">Devices</a><a href="/admin/licenses">Licenses</a><a href="/admin/eload">E-Load</a><a href="/admin/tokens">API Tokens</a><a href="/docs">Docs</a><form method="post" action="/logout" style="display:inline"><button class="secondary" style="padding:6px 9px;margin-left:12px">Logout</button></form></nav></div></header>
 <main class="wrap">${body}</main>
 </body></html>`;
 }
@@ -224,13 +350,16 @@ async function admin(req, res, url, db) {
   if (!verifySession(req)) return redirect(res, "/login");
 
   if (url.pathname === "/") {
+    ensureEload(db);
     const active = db.licenses.filter((license) => licenseStatus(license) === "active").length;
+    const balance = db.eload.accounts.reduce((sum, account) => sum + Number(account.balance || 0), 0);
     return send(res, 200, page("Dashboard", `
       <h1>Dashboard</h1>
       <div class="grid">
         <div class="card"><div class="metric">${db.devices.length}</div><div class="muted">Devices</div></div>
         <div class="card"><div class="metric">${db.licenses.length}</div><div class="muted">Licenses</div></div>
         <div class="card"><div class="metric">${active}</div><div class="muted">Active Licenses</div></div>
+        <div class="card"><div class="metric">${balance.toFixed(2)}</div><div class="muted">E-Load Balance</div></div>
         <div class="card"><div class="metric">${db.apiTokens.length}</div><div class="muted">API Tokens</div></div>
       </div>
       <div class="panel"><h2>Domains</h2><p><b>API:</b> ${escapeHtml(env.publicApiUrl)}</p><p><b>Admin:</b> ${escapeHtml(env.publicAdminUrl)}</p></div>
@@ -314,6 +443,60 @@ async function admin(req, res, url, db) {
     `), { "Content-Type": "text/html" });
   }
 
+  if (url.pathname === "/admin/eload" && req.method === "POST") {
+    const form = await formBody(req);
+    const eload = ensureEload(db);
+    if (form.action === "create-account") {
+      const apiKey = `3db_${crypto.randomBytes(12).toString("hex")}`;
+      const apiSecret = crypto.randomBytes(24).toString("base64url");
+      eload.accounts.push({
+        id: id("elo"),
+        name: String(form.name || "3DBPointLabs account"),
+        apiKey,
+        apiSecret,
+        balance: Number(form.balance || 0),
+        status: "active",
+        createdAt: now(),
+        updatedAt: now(),
+      });
+      await saveDb(db);
+      return send(res, 200, page("New E-Load Credentials", `<h1>New E-Load Credentials</h1><div class="panel"><p>Copy these into the Orange Pi Eload Settings page. The secret is shown once here.</p><label>API Key</label><pre>${escapeHtml(apiKey)}</pre><label>API Secret</label><pre>${escapeHtml(apiSecret)}</pre><p><a class="btn" href="/admin/eload">Back</a></p></div>`), { "Content-Type": "text/html" });
+    }
+    if (form.action === "add-balance") {
+      const account = eload.accounts.find((item) => item.id === form.accountId);
+      if (account) {
+        account.balance = Number(account.balance || 0) + Math.max(0, Number(form.amount || 0));
+        account.updatedAt = now();
+        db.audit.push({ at: now(), action: "eload.balance.added", accountId: account.id, amount: Number(form.amount || 0) });
+        await saveDb(db);
+      }
+    }
+    return redirect(res, "/admin/eload");
+  }
+
+  if (url.pathname === "/admin/eload") {
+    const eload = ensureEload(db);
+    return send(res, 200, page("E-Load", `
+      <h1>E-Load Provider</h1>
+      <div class="panel">
+        <h2>Create API Credentials</h2>
+        <form method="post">
+          <input type="hidden" name="action" value="create-account">
+          <div class="row"><div><label>Name</label><input name="name" value="Orange Pi e-load"></div><div><label>Starting Balance</label><input name="balance" type="number" step="0.01" value="0"></div></div>
+          <p><button>Create E-Load API Key</button></p>
+        </form>
+      </div>
+      <div class="panel">
+        <h2>Accounts / Balance</h2>
+        <table><thead><tr><th>Name</th><th>API Key</th><th>Balance</th><th>Status</th><th>Add Balance</th></tr></thead><tbody>${eload.accounts.map((a) => `<tr><td>${escapeHtml(a.name)}</td><td><code>${escapeHtml(a.apiKey)}</code></td><td>${Number(a.balance || 0).toFixed(2)}</td><td>${escapeHtml(a.status)}</td><td><form method="post" style="display:flex;gap:8px"><input type="hidden" name="action" value="add-balance"><input type="hidden" name="accountId" value="${escapeHtml(a.id)}"><input name="amount" type="number" step="0.01" min="0" placeholder="Amount"><button>Add</button></form></td></tr>`).join("")}</tbody></table>
+      </div>
+      <div class="panel">
+        <h2>Products</h2>
+        <table><thead><tr><th>Code</th><th>Name</th><th>Price</th><th>Networks</th></tr></thead><tbody>${eload.products.map((p) => `<tr><td>${escapeHtml(p.code)}</td><td>${escapeHtml(p.name)}</td><td>${Number(p.price || 0).toFixed(2)}</td><td>${escapeHtml((p.meta?.networks || []).join(", "))}</td></tr>`).join("")}</tbody></table>
+      </div>
+    `), { "Content-Type": "text/html" });
+  }
+
   if (url.pathname === "/docs") {
     return send(res, 200, page("Docs", `
       <h1>API Docs</h1>
@@ -334,6 +517,111 @@ POST /api/v1/licenses/validate</pre>
 
 async function api(req, res, url, db) {
   if (url.pathname === "/api/v1/status") return json(res, 200, { data: { status: "ok", service: "3dbpoint-license-platform", time: now() } });
+
+  const eloadRoute = url.pathname === "/api/v1/wallets"
+    || url.pathname === "/api/v1/account/status"
+    || url.pathname === "/api/v1/products"
+    || url.pathname === "/api/v1/orders"
+    || /^\/api\/v1\/orders\/[^/]+$/.test(url.pathname);
+
+  if (eloadRoute) {
+    const rawBody = ["POST", "PUT", "PATCH"].includes(req.method || "") ? await readBody(req) : "";
+    const account = await requireEloadAccount(req, db, rawBody);
+    if (!account) return json(res, 401, { error: { code: "unauthorized", message: "Missing or invalid e-load API credentials" } });
+    const eload = ensureEload(db);
+
+    if (url.pathname === "/api/v1/wallets" && req.method === "GET") {
+      return json(res, 200, {
+        data: [
+          {
+            id: account.id,
+            name: account.name,
+            currency: "PHP",
+            balance: Number(account.balance || 0),
+            isDefault: true,
+          },
+        ],
+      });
+    }
+
+    if (url.pathname === "/api/v1/account/status" && req.method === "GET") {
+      return json(res, 200, {
+        data: {
+          account: publicEloadAccount(account),
+          wallets: [
+            {
+              id: account.id,
+              name: account.name,
+              currency: "PHP",
+              balance: Number(account.balance || 0),
+              isDefault: true,
+            },
+          ],
+          subscription: {
+            id: "3dbpointlabs-live",
+            status: "active",
+            plan: "3DBPointLabs",
+          },
+        },
+      });
+    }
+
+    if (url.pathname === "/api/v1/products" && req.method === "GET") {
+      const category = url.searchParams.get("category") || "eload";
+      const limit = Math.min(1000, Math.max(1, Number(url.searchParams.get("limit") || 1000)));
+      const products = eload.products
+        .filter((product) => product.status !== "disabled" && (!category || product.category === category))
+        .slice(0, limit);
+      return json(res, 200, { data: { items: products } });
+    }
+
+    if (url.pathname === "/api/v1/orders" && req.method === "POST") {
+      let body = {};
+      try {
+        body = rawBody.trim() ? JSON.parse(rawBody) : {};
+      } catch {
+        return json(res, 400, { errors: { payload: ["Invalid JSON"] } });
+      }
+      const payload = body.payload || body;
+      const productCode = String(payload.productCode || payload.product_code || payload.code || "").trim();
+      const recipient = String(payload.recipient || payload.mobile_number || payload.number || "").trim();
+      const clientReference = String(payload.clientReference || payload.client_reference || "").trim();
+      const product = eload.products.find((item) => item.code === productCode);
+      if (!product) return json(res, 422, { errors: { code: ["Unknown product code"] } });
+      if (!recipient) return json(res, 422, { errors: { recipient: ["Recipient is required"] } });
+      const amount = Number(product.price || 0);
+      if (Number(account.balance || 0) < amount) return json(res, 402, { errors: { balance: ["Insufficient e-load balance"] } });
+      account.balance = Number(account.balance || 0) - amount;
+      account.updatedAt = now();
+      const order = {
+        id: id("ord"),
+        accountId: account.id,
+        productCode,
+        recipient,
+        clientReference,
+        amount,
+        currency: "PHP",
+        status: "success",
+        request: payload,
+        createdAt: now(),
+        updatedAt: now(),
+      };
+      eload.orders.push(order);
+      db.audit.push({ at: now(), action: "eload.order.created", orderId: order.id, accountId: account.id, amount });
+      await saveDb(db);
+      return json(res, 200, { status: "200", data: publicOrder(order) });
+    }
+
+    const orderMatch = url.pathname.match(/^\/api\/v1\/orders\/([^/]+)$/);
+    if (orderMatch && req.method === "GET") {
+      const orderId = decodeURIComponent(orderMatch[1]);
+      const order = eload.orders.find((item) => item.id === orderId && item.accountId === account.id);
+      if (!order) return json(res, 404, { error: { code: "not_found", message: "Order not found" } });
+      return json(res, 200, { data: publicOrder(order) });
+    }
+
+    return json(res, 404, { error: { code: "not_found", message: "E-load API endpoint not found" } });
+  }
 
   if (!(await requireApiToken(req, db))) {
     return json(res, 401, { error: { code: "unauthorized", message: "Missing or invalid bearer token" } });

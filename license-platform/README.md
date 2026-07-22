@@ -56,6 +56,61 @@ GET  /api/v1/devices/:serial/license
 POST /api/v1/licenses/validate
 ```
 
+## E-Load Provider API
+
+The same app also acts as the 3DBPointLabs e-load provider for the Orange Pi.
+
+Open:
+
+```text
+https://cpanel.3dbpoint.com/admin/eload
+```
+
+From there you can:
+
+- create an e-load API key/secret;
+- add provider balance;
+- see seeded e-load products.
+
+Copy the generated API key and API secret into the Orange Pi admin panel:
+
+```text
+Eload → Settings → API Key and Secret
+```
+
+The Orange Pi signs requests with:
+
+```http
+X-ACCESS-KEY: <api-key>
+X-ACCESS-NONCE: <nonce>
+X-ACCESS-SIGNATURE: md5(md5(nonce) + md5(raw-json-body-or-empty-string) + md5(apiKey + apiSecret))
+```
+
+Implemented e-load endpoints:
+
+```http
+GET  /api/v1/account/status
+GET  /api/v1/wallets
+GET  /api/v1/products?category=eload&limit=1000
+GET  /api/v1/products?category=epin&limit=1000
+POST /api/v1/orders
+GET  /api/v1/orders/:id
+```
+
+Order payload expected from the Orange Pi:
+
+```json
+{
+  "payload": {
+    "recipient": "09171234567",
+    "clientReference": "ORDER-123",
+    "productCode": "SMART10"
+  }
+}
+```
+
+The provider deducts the product price from the selected e-load account balance and stores the order in `/data/db.json`.
+
 Register device:
 
 ```bash
