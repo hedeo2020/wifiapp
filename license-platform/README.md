@@ -51,7 +51,7 @@ Remote admin pages:
 - `Devices` — bind owners, enable/disable devices, and queue sync/reload commands.
 - `Users` — create portal users, disable/enable accounts, and reset passwords.
 - `Licenses` — create, edit, revoke, reactivate, and set never-expire or dated license expiry.
-- `Remote IP` — create a public/global URL for an Orange Pi only when that device already has an active license.
+- `Public IP` — view public IPs reported by licensed Orange Pi devices.
 - `Operations` — queue Orange Pi commands such as `sync-license`, `reload-portal`, `restart-services`, `pull-config`, and `reboot`.
 - `Chats` — read portal user messages and send admin replies.
 - `E-Load` — create provider credentials, add balance, enable/disable accounts, manage products, and view orders.
@@ -73,15 +73,32 @@ GET  /api/v1/status
 POST /api/v1/devices/register
 GET  /api/v1/devices/:serial/license
 POST /api/v1/licenses/validate
-GET  /api/v1/devices/:serial/remote-access
+POST /api/v1/devices/:serial/public-ip
+GET  /api/v1/devices/:serial/public-ip
 GET  /api/v1/devices/:serial/operations
 POST /api/v1/operations/:id/ack
 ```
 
-Remote IP URLs are created from the admin console at `/admin/remotes`.
-They are license-gated. If a device has no active license, the API refuses
-to create the remote URL; if the license is later revoked or expired, the
-public `/r/:slug` page is blocked.
+Public IP records are reported by the Orange Pi to:
+
+```http
+POST /api/v1/devices/:serial/public-ip
+Authorization: Bearer <api-token>
+Content-Type: application/json
+```
+
+Example body:
+
+```json
+{
+  "publicIp": "203.0.113.10",
+  "protocol": "http",
+  "port": "80"
+}
+```
+
+The API checks the device license first. If the device has no active license,
+the public IP is not saved and the API returns `403 license_required`.
 
 ## E-Load Provider API
 

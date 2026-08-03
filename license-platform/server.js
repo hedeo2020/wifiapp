@@ -2,6 +2,7 @@ import http from "node:http";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import net from "node:net";
 import { URL } from "node:url";
 
 const env = {
@@ -194,6 +195,12 @@ async function jsonBody(req) {
   } catch {
     throw Object.assign(new Error("Invalid JSON"), { status: 400, code: "invalid_json" });
   }
+}
+
+function clientPublicIp(req) {
+  const forwarded = String(req.headers["x-forwarded-for"] || "").split(",").map((item) => item.trim()).filter(Boolean)[0];
+  const raw = forwarded || req.socket?.remoteAddress || "";
+  return normalizePublicIp(raw.replace(/^::ffff:/, ""));
 }
 
 function parseCookies(req) {
@@ -404,38 +411,82 @@ function remoteUrl(slug) {
 
 function publicRemoteAccess(remote, db) {
   const license = activeLicenseForDevice(db, remote.deviceSerial);
+  const protocol = remote.protocol || "http";
+  const port = remote.port ? `:${remote.port}` : "";
+  const publicIpUrl = remote.publicIp ? `${protocol}://${remote.publicIp}${port}` : null;
   return {
     id: remote.id,
     deviceSerial: remote.deviceSerial,
     slug: remote.slug,
-    url: remoteUrl(remote.slug),
+    url: publicIpUrl,
     status: license && remote.status === "active" ? "active" : "license_required",
-    target: remote.target || "http://10.0.0.1",
+    publicIp: remote.publicIp || "",
+    port: remote.port || "",
+    protocol,
+    target: publicIpUrl || remote.target || "",
+    source: remote.source || "pi",
     lastSeenAt: remote.lastSeenAt || null,
+    reportedAt: remote.reportedAt || null,
     createdAt: remote.createdAt,
     updatedAt: remote.updatedAt,
   };
 }
 
-function ensureRemoteForLicensedDevice(db, serial, target = "http://10.0.0.1") {
+function normalizePublicIp(value) {
+  const input = String(value || "").trim();
+  if (!input) return "";
+  try {
+    const parsed = new URL(input.includes("://") ? input : `http://${input}`);
+    return parsed.hostname.replace(/^\[|\]$/g, "");
+  } catch {
+    return input.replace(/:\d+$/, "");
+  }
+}
+
+function validPublicHost(value) {
+  const host = normalizePublicIp(value);
+  if (!host) return false;
+  if (host === "localhost") return false;
+  if (net.isIP(host)) {
+    if (host.startsWith("10.") || host.startsWith("192.168.") || host.startsWith("127.")) return false;
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return false;
+    if (host.startsWith("169.254.")) return false;
+    return true;
+  }
+  return /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(host);
+}
+
+function upsertReportedPublicIp(db, serial, publicIp, options = {}) {
   const license = activeLicenseForDevice(db, serial);
   if (!license) return { error: "license_required" };
+  const normalizedPublicIp = normalizePublicIp(publicIp);
+  if (!validPublicHost(normalizedPublicIp)) return { error: "invalid_public_ip" };
   let remote = db.remoteAccess.find((item) => item.deviceSerial === serial);
   if (!remote) {
     remote = {
       id: id("rem"),
       deviceSerial: serial,
       slug: `opi-${crypto.randomBytes(5).toString("hex")}`,
-      target,
+      publicIp: normalizedPublicIp,
+      port: String(options.port || "").trim(),
+      protocol: String(options.protocol || "http").trim().replace(/:$/, "") || "http",
+      target: "",
+      source: options.source || "pi",
       status: "active",
       createdAt: now(),
       updatedAt: now(),
-      lastSeenAt: null,
+      reportedAt: now(),
+      lastSeenAt: now(),
     };
     db.remoteAccess.push(remote);
   } else {
     remote.status = "active";
-    remote.target = target || remote.target || "http://10.0.0.1";
+    remote.publicIp = normalizedPublicIp;
+    remote.port = String(options.port ?? remote.port ?? "").trim();
+    remote.protocol = String(options.protocol || remote.protocol || "http").trim().replace(/:$/, "") || "http";
+    remote.source = options.source || remote.source || "pi";
+    remote.reportedAt = now();
+    remote.lastSeenAt = now();
     remote.updatedAt = now();
   }
   return { remote, license };
@@ -465,7 +516,7 @@ function page(title, body) {
   </style>
 </head>
 <body>
-<header><div class="top"><div class="brand">3DBPoint CPanel</div><nav><a href="/">Dashboard</a><a href="/admin/devices">Devices</a><a href="/admin/licenses">Licenses</a><a href="/admin/users">Users</a><a href="/admin/remotes">Remote IP</a><a href="/admin/operations">Operations</a><a href="/admin/chats">Chats</a><a href="/admin/eload">E-Load</a><a href="/admin/tokens">API Tokens</a><a href="/admin/audit">Audit</a><a href="/docs">Docs</a><form method="post" action="/logout" style="display:inline"><button class="secondary" style="padding:6px 9px;margin-left:12px">Logout</button></form></nav></div></header>
+<header><div class="top"><div class="brand">3DBPoint CPanel</div><nav><a href="/">Dashboard</a><a href="/admin/devices">Devices</a><a href="/admin/licenses">Licenses</a><a href="/admin/users">Users</a><a href="/admin/remotes">Public IP</a><a href="/admin/operations">Operations</a><a href="/admin/chats">Chats</a><a href="/admin/eload">E-Load</a><a href="/admin/tokens">API Tokens</a><a href="/admin/audit">Audit</a><a href="/docs">Docs</a><form method="post" action="/logout" style="display:inline"><button class="secondary" style="padding:6px 9px;margin-left:12px">Logout</button></form></nav></div></header>
 <main class="wrap">${body}</main>
 </body></html>`;
 }
@@ -513,7 +564,7 @@ async function admin(req, res, url, db) {
         <div class="card"><div class="metric">${activeRemotes}</div><div class="muted">Active Remote IPs</div></div>
         <div class="card"><div class="metric">${orderCount}</div><div class="muted">E-Load Orders</div></div>
       </div>
-      <div class="panel"><h2>Remote Access</h2><p>Create a public remote URL only for Orange Pi devices that already have an active license.</p><p class="actions"><a class="btn" href="/admin/remotes">Create Remote IP</a><a class="btn secondary" href="/admin/chats">Open Chats</a><a class="btn success" href="/admin/eload">Manage E-Load</a></p></div>
+      <div class="panel"><h2>Public IP Reporting</h2><p>The Orange Pi reports its public IP to this API. The API only stores it when that device already has an active license.</p><p class="actions"><a class="btn" href="/admin/remotes">View Public IPs</a><a class="btn secondary" href="/admin/chats">Open Chats</a><a class="btn success" href="/admin/eload">Manage E-Load</a></p></div>
       <div class="panel"><h2>Domains</h2><p><b>API:</b> ${escapeHtml(env.publicApiUrl)}</p><p><b>Admin:</b> ${escapeHtml(env.publicAdminUrl)}</p></div>
     `), { "Content-Type": "text/html" });
   }
@@ -721,25 +772,16 @@ async function admin(req, res, url, db) {
   if (url.pathname === "/admin/remotes" && req.method === "POST") {
     const form = await formBody(req);
     const deviceSerial = String(form.deviceSerial || "").trim();
-    const target = String(form.target || "http://10.0.0.1").trim();
+    const publicIp = String(form.publicIp || "").trim();
+    const port = String(form.port || "").trim();
+    const protocol = String(form.protocol || "http").trim();
     if (deviceSerial) {
-      const result = ensureRemoteForLicensedDevice(db, deviceSerial, target);
+      const result = upsertReportedPublicIp(db, deviceSerial, publicIp, { port, protocol, source: "admin" });
       if (!result.error) {
-        db.operations.push({
-          id: id("op"),
-          deviceSerial,
-          command: "enable-remote-access",
-          payload: { remoteUrl: remoteUrl(result.remote.slug), target: result.remote.target },
-          status: "pending",
-          result: null,
-          createdAt: now(),
-          updatedAt: now(),
-          acknowledgedAt: null,
-        });
-        db.audit.push({ at: now(), action: "remote.created", deviceSerial, remoteUrl: remoteUrl(result.remote.slug) });
+        db.audit.push({ at: now(), action: "public_ip.admin_saved", deviceSerial, publicIp: result.remote.publicIp });
         await saveDb(db);
       } else {
-        db.audit.push({ at: now(), action: "remote.denied_license_required", deviceSerial });
+        db.audit.push({ at: now(), action: `public_ip.denied_${result.error}`, deviceSerial, publicIp });
         await saveDb(db);
       }
     }
@@ -767,11 +809,11 @@ async function admin(req, res, url, db) {
     const licensedDevices = db.devices.filter((device) => activeLicenseForDevice(db, device.serial));
     const unlicensedSelected = selected && !activeLicenseForDevice(db, selected);
     const remotes = db.remoteAccess.map((remote) => publicRemoteAccess(remote, db)).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
-    return send(res, 200, page("Remote IP", `
-      <h1>Remote IP</h1>
-      <div class="panel"><p>This creates a public/global URL only when the selected Orange Pi already has an active license. If the license is revoked/expired, the remote URL is blocked automatically.</p>${unlicensedSelected ? `<p><span class="pill bad">No active license for ${escapeHtml(selected)}. Remote IP was not created.</span></p>` : ""}</div>
-      <div class="panel"><h2>Create Global Remote URL</h2><form method="post"><div class="row"><div><label>Licensed Device</label><input name="deviceSerial" list="licensed-device-serials" value="${escapeHtml(selected)}" required><datalist id="licensed-device-serials">${licensedDevices.map((d) => `<option value="${escapeHtml(d.serial)}">${escapeHtml(d.name || d.serial)}</option>`).join("")}</datalist><small class="muted">Only devices with active licenses are accepted.</small></div><div><label>Pi Local Target</label><input name="target" value="http://10.0.0.1"><small class="muted">The Pi/tunnel agent will connect this target to the public URL.</small></div></div><p><button>Create Remote IP</button></p></form></div>
-      <div class="panel scroll"><h2>Remote URLs</h2><table><thead><tr><th>Device</th><th>Global URL</th><th>Status</th><th>Target</th><th>Created</th><th>Actions</th></tr></thead><tbody>${remotes.map((remote) => `<tr><td><code>${escapeHtml(remote.deviceSerial)}</code></td><td><a href="${escapeHtml(remote.url)}" target="_blank" rel="noreferrer">${escapeHtml(remote.url)}</a></td><td><span class="pill ${remote.status === "active" ? "ok" : "bad"}">${escapeHtml(remote.status)}</span></td><td>${escapeHtml(remote.target)}</td><td>${escapeHtml(remote.createdAt)}</td><td><form method="post" action="/admin/remotes/${escapeHtml(remote.id)}/${remote.status === "active" ? "disable" : "enable"}"><button class="${remote.status === "active" ? "danger" : "success"}">${remote.status === "active" ? "Disable" : "Enable"}</button></form></td></tr>`).join("")}</tbody></table></div>
+    return send(res, 200, page("Public IP", `
+      <h1>Public IP</h1>
+      <div class="panel"><p>The Orange Pi should report its own public IP to <code>POST /api/v1/devices/:serial/public-ip</code>. The API checks the device license first; without an active license, the public IP is not saved.</p>${unlicensedSelected ? `<p><span class="pill bad">No active license for ${escapeHtml(selected)}. Public IP was not saved.</span></p>` : ""}</div>
+      <div class="panel"><h2>Manual Save / Test</h2><form method="post"><div class="row"><div><label>Licensed Device</label><input name="deviceSerial" list="licensed-device-serials" value="${escapeHtml(selected)}" required><datalist id="licensed-device-serials">${licensedDevices.map((d) => `<option value="${escapeHtml(d.serial)}">${escapeHtml(d.name || d.serial)}</option>`).join("")}</datalist><small class="muted">Only devices with active licenses are accepted.</small></div><div><label>Public IP or Host</label><input name="publicIp" placeholder="203.0.113.10" required></div><div><label>Protocol</label><select name="protocol"><option value="http">http</option><option value="https">https</option></select></div><div><label>Port</label><input name="port" placeholder="80"></div></div><p><button>Save Public IP</button></p></form></div>
+      <div class="panel scroll"><h2>Reported Public IPs</h2><table><thead><tr><th>Device</th><th>Public IP</th><th>Visit</th><th>Status</th><th>Reported</th><th>Source</th><th>Actions</th></tr></thead><tbody>${remotes.map((remote) => `<tr><td><code>${escapeHtml(remote.deviceSerial)}</code></td><td>${escapeHtml(remote.publicIp)}${remote.port ? `:${escapeHtml(remote.port)}` : ""}</td><td>${remote.url ? `<a href="${escapeHtml(remote.url)}" target="_blank" rel="noreferrer">${escapeHtml(remote.url)}</a>` : ""}</td><td><span class="pill ${remote.status === "active" ? "ok" : "bad"}">${escapeHtml(remote.status)}</span></td><td>${escapeHtml(remote.reportedAt || remote.updatedAt)}</td><td>${escapeHtml(remote.source)}</td><td><form method="post" action="/admin/remotes/${escapeHtml(remote.id)}/${remote.status === "active" ? "disable" : "enable"}"><button class="${remote.status === "active" ? "danger" : "success"}">${remote.status === "active" ? "Disable" : "Enable"}</button></form></td></tr>`).join("")}</tbody></table></div>
     `), { "Content-Type": "text/html" });
   }
 
@@ -964,7 +1006,8 @@ GET  /api/v1/devices/:serial/license
 POST /api/v1/licenses/validate
 GET  /api/v1/chats/messages?deviceSerial=...
 POST /api/v1/chats/messages
-GET  /api/v1/devices/:serial/remote-access
+POST /api/v1/devices/:serial/public-ip
+GET  /api/v1/devices/:serial/public-ip
 GET  /api/v1/devices/:serial/operations
 POST /api/v1/operations/:id/ack</pre>
       </div>
@@ -975,18 +1018,19 @@ POST /api/v1/operations/:id/ack</pre>
   if (remoteVisit && req.method === "GET") {
     const slug = decodeURIComponent(remoteVisit[1]);
     const remote = db.remoteAccess.find((item) => item.slug === slug);
-    if (!remote) return send(res, 404, page("Remote not found", "<h1>Remote IP not found</h1>"), { "Content-Type": "text/html" });
+    if (!remote) return send(res, 404, page("Public IP not found", "<h1>Public IP not found</h1>"), { "Content-Type": "text/html" });
     const publicRemote = publicRemoteAccess(remote, db);
     if (publicRemote.status !== "active") {
-      return send(res, 403, page("Remote blocked", `<h1>Remote IP blocked</h1><div class="panel"><p>This Orange Pi has no active license, so remote access is disabled.</p><p><b>Device:</b> <code>${escapeHtml(publicRemote.deviceSerial)}</code></p></div>`), { "Content-Type": "text/html" });
+      return send(res, 403, page("Public IP blocked", `<h1>Public IP blocked</h1><div class="panel"><p>This Orange Pi has no active license, so its reported public IP is hidden.</p><p><b>Device:</b> <code>${escapeHtml(publicRemote.deviceSerial)}</code></p></div>`), { "Content-Type": "text/html" });
     }
-    return send(res, 200, page("Remote IP", `
-      <h1>Remote IP Ready</h1>
+    return send(res, 200, page("Public IP", `
+      <h1>Public IP</h1>
       <div class="panel">
         <p><b>Device:</b> <code>${escapeHtml(publicRemote.deviceSerial)}</code></p>
-        <p><b>Target:</b> ${escapeHtml(publicRemote.target)}</p>
+        <p><b>Public IP:</b> ${escapeHtml(publicRemote.publicIp)}${publicRemote.port ? `:${escapeHtml(publicRemote.port)}` : ""}</p>
+        ${publicRemote.url ? `<p><a class="btn" href="${escapeHtml(publicRemote.url)}" target="_blank" rel="noreferrer">Open Pi Public IP</a></p>` : ""}
         <p><b>Status:</b> <span class="pill ok">licensed</span></p>
-        <p>This URL is reserved and license-gated. To make it show the live Orange Pi admin page, install/connect the Pi tunnel agent so it can bind <code>${escapeHtml(publicRemote.target)}</code> to this global URL.</p>
+        <p>This record came from the Orange Pi reporting its public IP to the API. If the license expires or is revoked, this page is blocked.</p>
       </div>
     `), { "Content-Type": "text/html" });
   }
@@ -1204,12 +1248,39 @@ async function api(req, res, url, db) {
     return json(res, 200, { data: { operations } });
   }
 
-  const deviceRemote = url.pathname.match(/^\/api\/v1\/devices\/([^/]+)\/remote-access$/);
-  if (deviceRemote && req.method === "GET") {
-    const serial = decodeURIComponent(deviceRemote[1]);
+  const devicePublicIp = url.pathname.match(/^\/api\/v1\/devices\/([^/]+)\/public-ip$/);
+  if (devicePublicIp && req.method === "POST") {
+    const serial = decodeURIComponent(devicePublicIp[1]);
+    const body = await jsonBody(req);
+    const device = db.devices.find((item) => item.serial === serial);
+    if (device) {
+      device.lastSeenAt = now();
+      device.updatedAt = now();
+    }
+    const publicIp = String(body.publicIp || body.public_ip || clientPublicIp(req)).trim();
+    const result = upsertReportedPublicIp(db, serial, publicIp, {
+      port: body.port || "",
+      protocol: body.protocol || "http",
+      source: "pi",
+    });
+    if (result.error === "license_required") {
+      db.audit.push({ at: now(), action: "public_ip.report_denied_license_required", deviceSerial: serial, publicIp });
+      await saveDb(db);
+      return json(res, 403, { error: { code: "license_required", message: "Active license is required before public IP can be saved" } });
+    }
+    if (result.error === "invalid_public_ip") {
+      return json(res, 422, { error: { code: "invalid_public_ip", message: "A valid public IP or public hostname is required" } });
+    }
+    db.audit.push({ at: now(), action: "public_ip.reported", deviceSerial: serial, publicIp: result.remote.publicIp });
+    await saveDb(db);
+    return json(res, 200, { data: publicRemoteAccess(result.remote, db) });
+  }
+
+  if (devicePublicIp && req.method === "GET") {
+    const serial = decodeURIComponent(devicePublicIp[1]);
     const remote = db.remoteAccess.find((item) => item.deviceSerial === serial);
     if (!remote) {
-      return json(res, 404, { error: { code: "not_found", message: "No remote URL created for this device" } });
+      return json(res, 404, { error: { code: "not_found", message: "No public IP has been reported for this device" } });
     }
     return json(res, 200, { data: publicRemoteAccess(remote, db) });
   }
