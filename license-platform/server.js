@@ -7,6 +7,7 @@ import { URL } from "node:url";
 
 const env = {
   port: Number(process.env.PORT || 3000),
+  nodeEnv: process.env.NODE_ENV || "development",
   dataDir: process.env.DATA_DIR || path.join(process.cwd(), "data"),
   appSecret: process.env.APP_SECRET || "dev-secret-change-me-before-production",
   adminUsername: process.env.ADMIN_USERNAME || "admin",
@@ -17,7 +18,33 @@ const env = {
   publicRemoteBaseUrl: process.env.PUBLIC_REMOTE_BASE_URL || process.env.PUBLIC_API_URL || "https://api.3dbpoint.com",
   defaultEloadApiKey: process.env.ELOAD_API_KEY || "3dbpoint-demo-key",
   defaultEloadApiSecret: process.env.ELOAD_API_SECRET || "3dbpoint-demo-secret-change-me",
+  // Cookies are marked Secure by default (this app is only meant to be reached over HTTPS
+  // behind the Coolify/Traefik proxy). Set COOKIE_SECURE=false only for local http:// testing.
+  cookieSecure: process.env.COOKIE_SECURE !== "false",
 };
+
+// Refuse to boot in production with any placeholder/dev secret still in place. This is the
+// single biggest real-world risk in this app: a misconfigured deploy silently running with
+// public, guessable defaults (admin/change-me, dev-token-change-me, etc).
+function assertProductionSecretsAreSet() {
+  if (env.nodeEnv !== "production") return;
+  const insecureDefaults = [
+    ["APP_SECRET", env.appSecret, "dev-secret-change-me-before-production"],
+    ["ADMIN_PASSWORD", env.adminPassword, "change-me"],
+    ["DEFAULT_API_TOKEN", env.defaultApiToken, "dev-token-change-me"],
+    ["ELOAD_API_KEY", env.defaultEloadApiKey, "3dbpoint-demo-key"],
+    ["ELOAD_API_SECRET", env.defaultEloadApiSecret, "3dbpoint-demo-secret-change-me"],
+  ];
+  const stillDefault = insecureDefaults.filter(([, value, fallback]) => value === fallback);
+  if (stillDefault.length > 0) {
+    const names = stillDefault.map(([name]) => name).join(", ");
+    console.error(
+      `Refusing to start in production: the following environment variables are still set to their insecure default values: ${names}. ` +
+      `Set real values in the Coolify app's environment variables before deploying.`
+    );
+    process.exit(1);
+  }
+}
 
 const dbPath = path.join(env.dataDir, "db.json");
 
@@ -30,6 +57,27 @@ const timingSafeEqual = (a, b) => {
   const bb = Buffer.from(String(b));
   return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
 };
+
+// Minimal in-memory sliding-window rate limiter for sensitive endpoints (admin login,
+// portal login, license validation). Good enough for a single-instance deployment; if this
+// ever runs multi-instance behind a load balancer, move this to a shared store (Redis, etc).
+const rateLimitBuckets = new Map();
+function rateLimited(key, max, windowMs) {
+  const nowMs = Date.now();
+  const bucket = (rateLimitBuckets.get(key) || []).filter((t) => nowMs - t < windowMs);
+  bucket.push(nowMs);
+  rateLimitBuckets.set(key, bucket);
+  return bucket.length > max;
+}
+function requestIp(req) {
+  return String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.socket?.remoteAddress || "unknown";
+}
+function tooManyRequests(res) {
+  return send(res, 429, JSON.stringify({ error: { code: "rate_limited", message: "Too many attempts, try again later" } }), {
+    "Content-Type": "application/json; charset=utf-8",
+    "Retry-After": "60",
+  });
+}
 
 async function loadDb() {
   await fs.mkdir(env.dataDir, { recursive: true });
@@ -61,8 +109,9 @@ async function loadDb() {
       apiTokens: [
         {
           id: id("tok"),
-          name: "Default device API token",
+          name: "Default bootstrap API token (unscoped — issue per-device tokens instead)",
           tokenHash: sha256(env.defaultApiToken),
+          deviceSerial: null,
           createdAt: now(),
           lastUsedAt: null,
         },
@@ -146,6 +195,8 @@ function send(res, status, body, headers = {}) {
     "Content-Length": buffer.length,
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "same-origin",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "frame-ancestors 'none'",
     ...headers,
   });
   res.end(buffer);
@@ -229,16 +280,29 @@ function verifySession(req) {
   }
 }
 
+// Returns the matching token record (or null). Tokens with a deviceSerial are scoped to that
+// one device; tokens with deviceSerial === null are unscoped "master" tokens (kept for backward
+// compatibility with the original shared bootstrap token). New tokens should be issued per
+// device via /admin/tokens so a single compromised Orange Pi can't read/write every other
+// device's chats, operations, and public IP records.
 async function requireApiToken(req, db) {
   const auth = req.headers.authorization || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
-  if (!token) return false;
+  if (!token) return null;
   const tokenHash = sha256(token);
   const found = db.apiTokens.find((entry) => entry.tokenHash === tokenHash);
-  if (!found) return false;
+  if (!found) return null;
   found.lastUsedAt = now();
   await saveDb(db);
-  return true;
+  return found;
+}
+
+function tokenAllowsDevice(token, serial) {
+  return !token.deviceSerial || token.deviceSerial === serial;
+}
+
+function forbidden(res, message = "This API token is not authorized for this device") {
+  return json(res, 403, { error: { code: "forbidden", message } });
 }
 
 function md5(value) {
@@ -529,17 +593,22 @@ async function admin(req, res, url, db) {
   ensureCore(db);
   if (url.pathname === "/login" && req.method === "GET") return send(res, 200, loginPage(), { "Content-Type": "text/html" });
   if (url.pathname === "/login" && req.method === "POST") {
+    if (rateLimited(`admin-login:${requestIp(req)}`, 8, 5 * 60 * 1000)) {
+      return send(res, 429, loginPage("Too many login attempts. Please wait a few minutes and try again."), { "Content-Type": "text/html" });
+    }
     const form = await formBody(req);
     if (timingSafeEqual(form.username || "", env.adminUsername) && timingSafeEqual(form.password || "", env.adminPassword)) {
+      const secure = env.cookieSecure ? "; Secure" : "";
       return send(res, 303, "", {
         Location: "/",
-        "Set-Cookie": `session=${encodeURIComponent(makeSession())}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800`,
+        "Set-Cookie": `session=${encodeURIComponent(makeSession())}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${secure}`,
       });
     }
     return send(res, 401, loginPage("Invalid username or password"), { "Content-Type": "text/html" });
   }
   if (url.pathname === "/logout" && req.method === "POST") {
-    return send(res, 303, "", { Location: "/login", "Set-Cookie": "session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0" });
+    const secure = env.cookieSecure ? "; Secure" : "";
+    return send(res, 303, "", { Location: "/login", "Set-Cookie": `session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secure}` });
   }
   if (!verifySession(req)) return redirect(res, "/login");
 
@@ -874,16 +943,18 @@ async function admin(req, res, url, db) {
   if (url.pathname === "/admin/tokens" && req.method === "POST") {
     const form = await formBody(req);
     const token = crypto.randomBytes(32).toString("base64url");
-    db.apiTokens.push({ id: id("tok"), name: String(form.name || "API token"), tokenHash: sha256(token), createdAt: now(), lastUsedAt: null });
+    const deviceSerial = String(form.deviceSerial || "").trim() || null;
+    db.apiTokens.push({ id: id("tok"), name: String(form.name || "API token"), tokenHash: sha256(token), deviceSerial, createdAt: now(), lastUsedAt: null });
+    db.audit.push({ at: now(), action: "token.created", deviceSerial: deviceSerial || "(unscoped)" });
     await saveDb(db);
-    return send(res, 200, page("New API Token", `<h1>New API Token</h1><div class="panel"><p>This token is shown once.</p><pre>${escapeHtml(token)}</pre><p><a class="btn" href="/admin/tokens">Back</a></p></div>`), { "Content-Type": "text/html" });
+    return send(res, 200, page("New API Token", `<h1>New API Token</h1><div class="panel"><p>This token is shown once.</p><pre>${escapeHtml(token)}</pre><p>${deviceSerial ? `Scoped to device <code>${escapeHtml(deviceSerial)}</code>.` : `<b>Unscoped token — can act as any device.</b> Prefer scoped, per-device tokens.`}</p><p><a class="btn" href="/admin/tokens">Back</a></p></div>`), { "Content-Type": "text/html" });
   }
 
   if (url.pathname === "/admin/tokens") {
     return send(res, 200, page("API Tokens", `
       <h1>API Tokens</h1>
-      <div class="panel"><form method="post"><label>Name</label><input name="name" value="Orange Pi agent"><p><button>Create Token</button></p></form></div>
-      <div class="panel"><table><thead><tr><th>Name</th><th>Created</th><th>Last Used</th></tr></thead><tbody>${db.apiTokens.map((t) => `<tr><td>${escapeHtml(t.name)}</td><td>${escapeHtml(t.createdAt)}</td><td>${escapeHtml(t.lastUsedAt || "")}</td></tr>`).join("")}</tbody></table></div>
+      <div class="panel"><p>Prefer creating one token per Orange Pi, scoped to its device serial. Unscoped tokens can read/write every device's chats, operations, and public IP — keep those for admin tooling only.</p><form method="post"><div class="row"><div><label>Name</label><input name="name" value="Orange Pi agent"></div><div><label>Device Serial (leave blank for unscoped)</label><input name="deviceSerial" list="token-device-serials" placeholder="e.g. 02c000816800547a"><datalist id="token-device-serials">${db.devices.map((d) => `<option value="${escapeHtml(d.serial)}"></option>`).join("")}</datalist></div></div><p><button>Create Token</button></p></form></div>
+      <div class="panel"><table><thead><tr><th>Name</th><th>Scope</th><th>Created</th><th>Last Used</th></tr></thead><tbody>${db.apiTokens.map((t) => `<tr><td>${escapeHtml(t.name)}</td><td>${t.deviceSerial ? `<span class="pill ok"><code>${escapeHtml(t.deviceSerial)}</code></span>` : `<span class="pill warn">unscoped</span>`}</td><td>${escapeHtml(t.createdAt)}</td><td>${escapeHtml(t.lastUsedAt || "")}</td></tr>`).join("")}</tbody></table></div>
     `), { "Content-Type": "text/html" });
   }
 
@@ -1059,6 +1130,9 @@ async function api(req, res, url, db) {
   }
 
   if (url.pathname === "/api/v1/auth/login" && req.method === "POST") {
+    if (rateLimited(`user-login:${requestIp(req)}`, 10, 5 * 60 * 1000)) {
+      return json(res, 429, { error: { code: "rate_limited", message: "Too many login attempts, try again later" } });
+    }
     const body = await jsonBody(req);
     const email = String(body.email || "").trim().toLowerCase();
     const password = String(body.password || "");
@@ -1226,13 +1300,15 @@ async function api(req, res, url, db) {
     return json(res, 404, { error: { code: "not_found", message: "E-load API endpoint not found" } });
   }
 
-  if (!(await requireApiToken(req, db))) {
+  const apiToken = await requireApiToken(req, db);
+  if (!apiToken) {
     return json(res, 401, { error: { code: "unauthorized", message: "Missing or invalid bearer token" } });
   }
 
   const deviceOperations = url.pathname.match(/^\/api\/v1\/devices\/([^/]+)\/operations$/);
   if (deviceOperations && req.method === "GET") {
     const serial = decodeURIComponent(deviceOperations[1]);
+    if (!tokenAllowsDevice(apiToken, serial)) return forbidden(res);
     const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 20)));
     const operations = db.operations
       .filter((operation) => operation.deviceSerial === serial && (operation.status || "pending") === "pending")
@@ -1251,6 +1327,7 @@ async function api(req, res, url, db) {
   const devicePublicIp = url.pathname.match(/^\/api\/v1\/devices\/([^/]+)\/public-ip$/);
   if (devicePublicIp && req.method === "POST") {
     const serial = decodeURIComponent(devicePublicIp[1]);
+    if (!tokenAllowsDevice(apiToken, serial)) return forbidden(res);
     const body = await jsonBody(req);
     const device = db.devices.find((item) => item.serial === serial);
     if (device) {
@@ -1278,6 +1355,7 @@ async function api(req, res, url, db) {
 
   if (devicePublicIp && req.method === "GET") {
     const serial = decodeURIComponent(devicePublicIp[1]);
+    if (!tokenAllowsDevice(apiToken, serial)) return forbidden(res);
     const remote = db.remoteAccess.find((item) => item.deviceSerial === serial);
     if (!remote) {
       return json(res, 404, { error: { code: "not_found", message: "No public IP has been reported for this device" } });
@@ -1290,6 +1368,7 @@ async function api(req, res, url, db) {
     const body = await jsonBody(req);
     const operation = db.operations.find((item) => item.id === operationAck[1]);
     if (!operation) return json(res, 404, { error: { code: "not_found", message: "Operation not found" } });
+    if (!tokenAllowsDevice(apiToken, operation.deviceSerial)) return forbidden(res);
     operation.status = String(body.status || "done");
     operation.result = body.result || null;
     operation.acknowledgedAt = now();
@@ -1300,6 +1379,7 @@ async function api(req, res, url, db) {
   }
 
   if (url.pathname === "/api/v1/admin/summary" && req.method === "GET") {
+    if (apiToken.deviceSerial) return forbidden(res, "Fleet-wide summary requires an unscoped admin token");
     ensureEload(db);
     return json(res, 200, {
       data: {
@@ -1319,6 +1399,7 @@ async function api(req, res, url, db) {
     const body = await jsonBody(req);
     const serial = String(body.serial || "").trim();
     if (!serial) return json(res, 422, { error: { code: "validation_error", message: "serial is required" } });
+    if (!tokenAllowsDevice(apiToken, serial)) return forbidden(res);
     let device = db.devices.find((item) => item.serial === serial);
     if (!device) {
       device = { id: id("dev"), serial, name: body.name || serial, status: "active", createdAt: now(), updatedAt: now(), lastSeenAt: now() };
@@ -1335,6 +1416,7 @@ async function api(req, res, url, db) {
   if (url.pathname === "/api/v1/chats/messages" && req.method === "GET") {
     const deviceSerial = String(url.searchParams.get("deviceSerial") || "").trim();
     if (!deviceSerial) return json(res, 422, { error: { code: "validation_error", message: "deviceSerial is required" } });
+    if (!tokenAllowsDevice(apiToken, deviceSerial)) return forbidden(res);
     const messages = db.chats
       .filter((m) => m.deviceSerial === deviceSerial)
       .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)))
@@ -1346,9 +1428,12 @@ async function api(req, res, url, db) {
     const body = await jsonBody(req);
     const deviceSerial = String(body.deviceSerial || "").trim();
     const message = String(body.message || "").trim();
-    const senderAdmin = Boolean(body.senderAdmin);
+    // Only an unscoped/admin token may post as the admin; a device-scoped token (i.e. an
+    // Orange Pi's own token) can never impersonate the operator in another device's chat.
+    const senderAdmin = apiToken.deviceSerial ? false : Boolean(body.senderAdmin);
     if (!deviceSerial) return json(res, 422, { error: { code: "validation_error", message: "deviceSerial is required" } });
     if (!message) return json(res, 422, { error: { code: "validation_error", message: "message is required" } });
+    if (!tokenAllowsDevice(apiToken, deviceSerial)) return forbidden(res);
     const device = db.devices.find((d) => d.serial === deviceSerial);
     const user = device?.ownerUserId ? db.users.find((u) => u.id === device.ownerUserId) : null;
     const chat = {
@@ -1371,6 +1456,8 @@ async function api(req, res, url, db) {
   if (url.pathname === "/api/v1/chats/messages/read" && req.method === "POST") {
     const body = await jsonBody(req);
     const deviceSerial = String(body.deviceSerial || "").trim();
+    if (deviceSerial && !tokenAllowsDevice(apiToken, deviceSerial)) return forbidden(res);
+    if (!deviceSerial && apiToken.deviceSerial) return forbidden(res, "A device-scoped token must include its own deviceSerial");
     const forAdmin = Boolean(body.forAdmin);
     for (const m of db.chats) {
       if (deviceSerial && m.deviceSerial !== deviceSerial) continue;
@@ -1386,11 +1473,15 @@ async function api(req, res, url, db) {
   const deviceLicense = url.pathname.match(/^\/api\/v1\/devices\/([^/]+)\/license$/);
   if (deviceLicense && req.method === "GET") {
     const serial = decodeURIComponent(deviceLicense[1]);
+    if (!tokenAllowsDevice(apiToken, serial)) return forbidden(res);
     const license = db.licenses.find((item) => item.deviceSerial === serial && licenseStatus(item) === "active");
     return json(res, license ? 200 : 404, license ? { data: publicLicense(license) } : { error: { code: "not_found", message: "No active license for device" } });
   }
 
   if (url.pathname === "/api/v1/licenses/validate" && req.method === "POST") {
+    if (rateLimited(`license-validate:${requestIp(req)}`, 60, 60 * 1000)) {
+      return json(res, 429, { error: { code: "rate_limited", message: "Too many requests, try again later" } });
+    }
     const body = await jsonBody(req);
     const key = String(body.key || "").trim();
     const serial = String(body.serial || "").trim();
@@ -1414,6 +1505,8 @@ const server = http.createServer(async (req, res) => {
     if (status >= 500) console.error(error);
   }
 });
+
+assertProductionSecretsAreSet();
 
 server.listen(env.port, () => {
   console.log(`3DBPoint license platform listening on :${env.port}`);

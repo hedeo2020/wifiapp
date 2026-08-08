@@ -2,12 +2,23 @@ services:
   license-platform:
     build: .
     restart: unless-stopped
-    ports:
-      - "3000:3000"
+    # No host port is published on purpose. Publishing 3000:3000 would let anyone reach the
+    # admin login and API directly over plain HTTP on the VPS's public IP, bypassing Traefik's
+    # HTTPS termination entirely (credentials/tokens sent in cleartext). Coolify's Traefik proxy
+    # reaches this container over the shared Docker network below, using the Dockerfile's
+    # EXPOSE 3000 — it does not need a host port mapping.
+    # If Coolify's "New App from Git repo" flow is used instead (see README), Coolify manages
+    # the network/labels itself and this file isn't needed at all.
+    networks:
+      - coolify
     env_file:
       - .env
     volumes:
       - license-platform-data:/data
+
+networks:
+  coolify:
+    external: true
 
 volumes:
   license-platform-data:
