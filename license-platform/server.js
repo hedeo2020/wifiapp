@@ -4,6 +4,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import net from "node:net";
 import { URL } from "node:url";
+import { execFile } from "node:child_process";
 
 const env = {
   port: Number(process.env.PORT || 3000),
@@ -21,6 +22,11 @@ const env = {
   // Cookies are marked Secure by default (this app is only meant to be reached over HTTPS
   // behind the Coolify/Traefik proxy). Set COOKIE_SECURE=false only for local http:// testing.
   cookieSecure: process.env.COOKIE_SECURE !== "false",
+  // Reverse-tunnel auto-provisioning bridge: a forced-command SSH key that can only ever
+  // run one fixed script on the VPS host, used to provision per-device tunnel users.
+  pfibridgeHost: process.env.PFIBRIDGE_HOST || "161.118.244.168",
+  pfibridgeUser: process.env.PFIBRIDGE_USER || "pfibridge",
+  pfibridgeKeyPath: process.env.PFIBRIDGE_KEY_PATH || path.join(process.cwd(), "..", "data", "pfibridge_ed25519"),
 };
 
 // Refuse to boot in production with any placeholder/dev secret still in place. This is the
@@ -554,6 +560,39 @@ function upsertReportedPublicIp(db, serial, publicIp, options = {}) {
     remote.updatedAt = now();
   }
   return { remote, license };
+}
+
+const SERIAL_PATTERN = /^[a-fA-F0-9]{8,32}$/;
+const SSH_PUBLIC_KEY_PATTERN = /^ssh-(ed25519|rsa|ecdsa-[a-z0-9-]+) [A-Za-z0-9+/=]+( .*)?$/;
+
+// Provisions (or fetches the existing allocation for) this device's reverse-tunnel VPS
+// user by invoking the pfibridge forced-command SSH key. That key can only ever run one
+// fixed script on the host (/opt/pfitunnel/register_device.sh) with the two arguments we
+// pass here -- it cannot open a shell or run anything else, even if this container were
+// fully compromised.
+function registerTunnel(serial, publicKey) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "ssh",
+      [
+        "-i", env.pfibridgeKeyPath,
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=10",
+        "-o", "BatchMode=yes",
+        `${env.pfibridgeUser}@${env.pfibridgeHost}`,
+        `${serial} ${publicKey}`,
+      ],
+      { timeout: 20000 },
+      (err, stdout, stderr) => {
+        if (err) return reject(new Error(String(stderr || err.message).trim()));
+        try {
+          resolve(JSON.parse(stdout));
+        } catch {
+          reject(new Error("unexpected response from provisioning bridge"));
+        }
+      }
+    );
+  });
 }
 
 function page(title, body) {
@@ -1361,6 +1400,61 @@ async function api(req, res, url, db) {
       return json(res, 404, { error: { code: "not_found", message: "No public IP has been reported for this device" } });
     }
     return json(res, 200, { data: publicRemoteAccess(remote, db) });
+  }
+
+  // Self-service reverse-tunnel provisioning: a licensed device submits its own SSH public
+  // key and gets back a dedicated, restricted port assignment on the VPS. No manual admin
+  // steps required -- this replaces what used to be a by-hand provisioning script per device.
+  const deviceTunnel = url.pathname.match(/^\/api\/v1\/devices\/([^/]+)\/tunnel$/);
+  if (deviceTunnel && req.method === "POST") {
+    const serial = decodeURIComponent(deviceTunnel[1]);
+    if (!tokenAllowsDevice(apiToken, serial)) return forbidden(res);
+    if (!SERIAL_PATTERN.test(serial)) {
+      return json(res, 422, { error: { code: "invalid_serial", message: "Device serial is not in the expected format" } });
+    }
+    if (!activeLicenseForDevice(db, serial)) {
+      db.audit.push({ at: now(), action: "tunnel.denied_license_required", deviceSerial: serial });
+      await saveDb(db);
+      return json(res, 403, { error: { code: "license_required", message: "Active license is required before a tunnel can be provisioned" } });
+    }
+    const body = await jsonBody(req);
+    const publicKey = String(body.publicKey || body.public_key || "").trim();
+    if (!SSH_PUBLIC_KEY_PATTERN.test(publicKey)) {
+      return json(res, 422, { error: { code: "invalid_public_key", message: "A valid SSH public key is required" } });
+    }
+
+    let allocation;
+    try {
+      allocation = await registerTunnel(serial, publicKey);
+    } catch (err) {
+      db.audit.push({ at: now(), action: "tunnel.provisioning_failed", deviceSerial: serial, error: err.message });
+      await saveDb(db);
+      return json(res, 502, { error: { code: "provisioning_failed", message: "Could not provision the tunnel; try again shortly" } });
+    }
+
+    const result = upsertReportedPublicIp(db, serial, allocation.vpsHost, {
+      port: String(allocation.httpPort),
+      protocol: "http",
+      source: "pi",
+    });
+    db.audit.push({
+      at: now(),
+      action: allocation.created ? "tunnel.provisioned" : "tunnel.reused_existing",
+      deviceSerial: serial,
+      sshPort: allocation.sshPort,
+      httpPort: allocation.httpPort,
+    });
+    await saveDb(db);
+
+    return json(res, 200, {
+      data: {
+        sshHost: allocation.vpsHost,
+        sshPort: allocation.sshPort,
+        sshUser: allocation.username,
+        httpUrl: `http://${allocation.vpsHost}:${allocation.httpPort}`,
+        remoteAccess: publicRemoteAccess(result.remote, db),
+      },
+    });
   }
 
   const operationAck = url.pathname.match(/^\/api\/v1\/operations\/([^/]+)\/ack$/);

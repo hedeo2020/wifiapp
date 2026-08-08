@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# SUPERSEDED: devices now provision their own tunnel automatically via
+# POST /api/v1/devices/:serial/tunnel once licensed (see
+# license-platform/vps-scripts/README.md). Kept here only as a manual
+# fallback for troubleshooting -- new devices don't need to run this.
+#
 # Provisions a per-device reverse SSH tunnel (SSH + admin panel access) from
 # a new Orange Pi kiosk to the VPS, following the same pattern used for the
 # first device (serial 02c000816800547a -> ports 2222/8088).
